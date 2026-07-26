@@ -1,0 +1,244 @@
+using EasyUnpack.Core.Archives;
+using EasyUnpack.Core.Engines;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace EasyUnpack.Core.Extraction;
+
+public sealed partial class ArchiveExtractionService
+{
+    private readonly IArchiveEngine _engine;
+    private readonly IArchiveSourceRecycler _recycler;
+
+    public ArchiveExtractionService(IArchiveEngine engine, IArchiveSourceRecycler recycler)
+    {
+        _engine = engine;
+        _recycler = recycler;
+    }
+
+    public int MaximumNestedDepth { get; init; } = 10;
+
+    public async Task<ExtractionResult> ExtractAsync(ArchiveCandidate candidate, IReadOnlyList<string>? passwords = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+        var sourceDirectory = Path.GetDirectoryName(candidate.Path) ?? throw new InvalidOperationException("Archive source directory is unavailable.");
+        var volumes = ArchiveVolumeResolver.Resolve(candidate);
+        if (!volumes.IsComplete) throw new InvalidDataException(volumes.IncompleteReason);
+        var workingDirectory = Path.Combine(sourceDirectory, $".easyunpack-{Guid.NewGuid():N}");
+        var consumedDirectory = Path.Combine(sourceDirectory, $".easyunpack-consumed-{Guid.NewGuid():N}");
+        var extractionDirectory = Path.Combine(workingDirectory, "contents");
+        var published = false;
+
+        try
+        {
+            Directory.CreateDirectory(extractionDirectory);
+            var engineArchivePath = PrepareEngineArchivePath(volumes, workingDirectory);
+            var password = await FindWorkingPasswordAsync(engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
+            var extraction = password is null
+                ? await _engine.ExtractAsync(engineArchivePath, extractionDirectory, cancellationToken).ConfigureAwait(false)
+                : await ((IPasswordArchiveEngine)_engine).ExtractWithPasswordAsync(engineArchivePath, extractionDirectory, password, cancellationToken).ConfigureAwait(false);
+            if (!extraction.Succeeded) throw new InvalidDataException($"{_engine.Descriptor.DisplayName} could not extract the archive.");
+
+            await ProcessNestedArchivesAsync(extractionDirectory, workingDirectory, consumedDirectory, passwords, cancellationToken).ConfigureAwait(false);
+            NormalizeOutputTree(extractionDirectory, cancellationToken);
+            var targetDirectory = ReserveTargetDirectory(sourceDirectory, candidate.LogicalName);
+            Directory.Move(extractionDirectory, targetDirectory);
+            published = true;
+
+            try
+            {
+                var recyclePaths = volumes.SourcePaths.ToList();
+                if (Directory.Exists(consumedDirectory)) recyclePaths.Add(consumedDirectory);
+                await _recycler.RecycleAsync(recyclePaths, cancellationToken).ConfigureAwait(false);
+                return new ExtractionResult(targetDirectory, true, null);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                return new ExtractionResult(targetDirectory, false, $"Extraction completed, but source archives were not moved to the recycle bin: {exception.Message}");
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(workingDirectory)) Directory.Delete(workingDirectory, recursive: true);
+            if (!published && Directory.Exists(consumedDirectory)) Directory.Delete(consumedDirectory, recursive: true);
+        }
+    }
+
+    private async Task ProcessNestedArchivesAsync(string rootDirectory, string workingDirectory, string consumedDirectory, IReadOnlyList<string>? passwords, CancellationToken cancellationToken)
+    {
+        var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var depth = 0; ; depth++)
+        {
+            var candidates = ArchiveCandidateDiscovery.Discover([rootDirectory], cancellationToken)
+                .Where(candidate => processed.Add(Path.GetFullPath(candidate.Path)))
+                .ToArray();
+            if (candidates.Length == 0) return;
+            if (depth >= MaximumNestedDepth) throw new InvalidDataException($"Nested archive depth exceeds the configured limit of {MaximumNestedDepth}.");
+
+            foreach (var nested in candidates)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await ExtractNestedArchiveAsync(nested, workingDirectory, consumedDirectory, passwords, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task ExtractNestedArchiveAsync(ArchiveCandidate candidate, string workingDirectory, string consumedDirectory, IReadOnlyList<string>? passwords, CancellationToken cancellationToken)
+    {
+        var nestedWorkingDirectory = Path.Combine(workingDirectory, $"nested-{Guid.NewGuid():N}");
+        var nestedContentsDirectory = Path.Combine(nestedWorkingDirectory, "contents");
+        try
+        {
+            var volumes = ArchiveVolumeResolver.Resolve(candidate);
+            if (!volumes.IsComplete) throw new InvalidDataException(volumes.IncompleteReason);
+            Directory.CreateDirectory(nestedContentsDirectory);
+            var engineArchivePath = PrepareEngineArchivePath(volumes, nestedWorkingDirectory);
+            var password = await FindWorkingPasswordAsync(engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
+            var extraction = password is null
+                ? await _engine.ExtractAsync(engineArchivePath, nestedContentsDirectory, cancellationToken).ConfigureAwait(false)
+                : await ((IPasswordArchiveEngine)_engine).ExtractWithPasswordAsync(engineArchivePath, nestedContentsDirectory, password, cancellationToken).ConfigureAwait(false);
+            if (!extraction.Succeeded) throw new InvalidDataException($"{_engine.Descriptor.DisplayName} could not extract nested archive {candidate.Path}.");
+
+            NormalizeOutputTree(nestedContentsDirectory, cancellationToken);
+            var targetDirectory = ReserveTargetDirectory(Path.GetDirectoryName(candidate.Path)!, candidate.LogicalName);
+            Directory.CreateDirectory(consumedDirectory);
+            foreach (var sourcePath in volumes.SourcePaths)
+            {
+                File.Move(sourcePath, Path.Combine(consumedDirectory, $"{Guid.NewGuid():N}-{Path.GetFileName(sourcePath)}"));
+            }
+            Directory.Move(nestedContentsDirectory, targetDirectory);
+        }
+        finally
+        {
+            if (Directory.Exists(nestedWorkingDirectory)) Directory.Delete(nestedWorkingDirectory, recursive: true);
+        }
+    }
+
+    private async Task<string?> FindWorkingPasswordAsync(string archivePath, IReadOnlyList<string>? passwords, CancellationToken cancellationToken)
+    {
+        var validation = await _engine.TestAsync(archivePath, cancellationToken).ConfigureAwait(false);
+        if (validation.Succeeded) return null;
+
+        if (_engine is not IPasswordArchiveEngine passwordEngine)
+        {
+            throw new InvalidDataException($"{_engine.Descriptor.DisplayName} could not validate the archive.");
+        }
+
+        var attempted = 0;
+        foreach (var password in passwords ?? [])
+        {
+            if (string.IsNullOrEmpty(password)) continue;
+            attempted++;
+            if ((await passwordEngine.TestWithPasswordAsync(archivePath, password, cancellationToken).ConfigureAwait(false)).Succeeded) return password;
+        }
+
+        throw new ArchivePasswordRequiredException(archivePath, attempted);
+    }
+
+    private static string PrepareEngineArchivePath(ArchiveVolumeSet volumes, string workingDirectory)
+    {
+        if (volumes.CanonicalNames.Count == 0) return volumes.PrimaryPath;
+
+        var aliasDirectory = Path.Combine(workingDirectory, "volume-aliases");
+        Directory.CreateDirectory(aliasDirectory);
+        foreach (var sourcePath in volumes.SourcePaths)
+        {
+            if (!volumes.CanonicalNames.TryGetValue(sourcePath, out var canonicalName))
+            {
+                throw new InvalidDataException("The archive volume alias set is incomplete.");
+            }
+
+            var aliasPath = Path.Combine(aliasDirectory, canonicalName);
+            try
+            {
+                CreateHardLink(aliasPath, sourcePath);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+            {
+                throw new InvalidOperationException("EasyUnpack could not create safe temporary names for the renamed archive volumes.", exception);
+            }
+        }
+
+        return Path.Combine(aliasDirectory, volumes.CanonicalNames[volumes.PrimaryPath]);
+    }
+
+    private static void CreateHardLink(string linkPath, string existingPath)
+    {
+        if (CreateHardLinkNative(linkPath, existingPath, IntPtr.Zero)) return;
+        throw new IOException("Windows could not create a temporary archive-volume hard link.", new Win32Exception(Marshal.GetLastWin32Error()));
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateHardLinkW", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateHardLinkNative(string fileName, string existingFileName, IntPtr securityAttributes);
+
+    private static void NormalizeOutputTree(string directory, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        while (TryGetOnlyOrdinaryChildDirectory(directory, out var onlyChild))
+        {
+            LiftChildContents(directory, onlyChild, cancellationToken);
+        }
+
+        foreach (var childDirectory in Directory.GetDirectories(directory))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (IsReparsePoint(childDirectory)) continue;
+            NormalizeOutputTree(childDirectory, cancellationToken);
+        }
+    }
+
+    private static bool TryGetOnlyOrdinaryChildDirectory(string directory, out string childDirectory)
+    {
+        var entries = Directory.GetFileSystemEntries(directory);
+        if (entries.Length == 1 && Directory.Exists(entries[0]) && !IsReparsePoint(entries[0]))
+        {
+            childDirectory = entries[0];
+            return true;
+        }
+
+        childDirectory = string.Empty;
+        return false;
+    }
+
+    private static void LiftChildContents(string directory, string childDirectory, CancellationToken cancellationToken)
+    {
+        var parentDirectory = Path.GetDirectoryName(directory)
+            ?? throw new InvalidOperationException("The extraction directory cannot be a file-system root.");
+        string temporaryDirectory;
+        do
+        {
+            temporaryDirectory = Path.Combine(parentDirectory, $".easyunpack-flatten-{Guid.NewGuid():N}");
+        }
+        while (Directory.Exists(temporaryDirectory) || File.Exists(temporaryDirectory));
+
+        Directory.Move(childDirectory, temporaryDirectory);
+        foreach (var entry in Directory.GetFileSystemEntries(temporaryDirectory))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var destination = Path.Combine(directory, Path.GetFileName(entry));
+            if ((File.GetAttributes(entry) & FileAttributes.Directory) != 0)
+            {
+                Directory.Move(entry, destination);
+            }
+            else
+            {
+                File.Move(entry, destination);
+            }
+        }
+        Directory.Delete(temporaryDirectory);
+    }
+
+    private static bool IsReparsePoint(string path) => (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+
+    private static string ReserveTargetDirectory(string sourceDirectory, string logicalName)
+    {
+        var candidate = Path.Combine(sourceDirectory, logicalName);
+        for (var index = 2; Directory.Exists(candidate) || File.Exists(candidate); ++index)
+        {
+            candidate = Path.Combine(sourceDirectory, $"{logicalName} ({index})");
+        }
+
+        return candidate;
+    }
+}

@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/EasyUnpack.App/EasyUnpack.App.csproj" />
+    <Project Path="src/EasyUnpack.Core/EasyUnpack.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/EasyUnpack.Core.Tests/EasyUnpack.Core.Tests.csproj" />
+  </Folder>
+</Solution>
