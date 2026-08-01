@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using EasyUnpack.Core.Archives;
 
 namespace EasyUnpack.Core.Tests;
@@ -31,6 +32,27 @@ public sealed class ArchiveCandidateDiscoveryTests : IDisposable
 
         Assert.Empty(ArchiveCandidateDiscovery.Discover([_directory]));
         Assert.Single(ArchiveCandidateDiscovery.Discover([document]));
+    }
+
+    [Fact]
+    public void Discover_carries_the_offset_of_an_appended_zip()
+    {
+        var path = Path.Combine(_directory, "video.mp4");
+        var prefix = "media"u8.ToArray();
+        using var buffer = new MemoryStream();
+        using (var archive = new ZipArchive(buffer, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            using var writer = new StreamWriter(archive.CreateEntry("content.txt").Open());
+            writer.Write("content");
+        }
+        var zip = buffer.ToArray();
+        File.WriteAllBytes(path, [.. prefix, .. zip, .. "trailer"u8]);
+
+        var candidate = Assert.Single(ArchiveCandidateDiscovery.Discover([path]));
+
+        Assert.Equal(ArchiveFormat.Zip, candidate.Format);
+        Assert.Equal(prefix.Length, candidate.ArchiveOffset);
+        Assert.Equal(zip.Length, candidate.ArchiveLength);
     }
 
     public void Dispose()

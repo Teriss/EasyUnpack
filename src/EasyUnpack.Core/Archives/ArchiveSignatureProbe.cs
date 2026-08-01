@@ -1,8 +1,13 @@
+using System.Buffers.Binary;
+
 namespace EasyUnpack.Core.Archives;
 
 public static class ArchiveSignatureProbe
 {
     private const int ProbeLength = 512;
+    private const int ZipEndRecordLength = 22;
+    private const int MaximumZipCommentLength = ushort.MaxValue;
+    private const int ZipCentralDirectoryHeaderLength = 46;
 
     public static ArchiveProbeResult Probe(string path)
     {
@@ -12,7 +17,12 @@ public static class ArchiveSignatureProbe
         var buffer = new byte[ProbeLength];
         var count = stream.Read(buffer, 0, buffer.Length);
         var format = Detect(buffer.AsSpan(0, count));
-        return new ArchiveProbeResult(path, format, format != ArchiveFormat.Unknown);
+        if (format != ArchiveFormat.Unknown) return new ArchiveProbeResult(path, format, true);
+
+        var embeddedZip = FindEmbeddedZip(stream);
+        return embeddedZip is null
+            ? new ArchiveProbeResult(path, ArchiveFormat.Unknown, false)
+            : new ArchiveProbeResult(path, ArchiveFormat.Zip, true, embeddedZip.Value.Offset, embeddedZip.Value.Length);
     }
 
     public static ArchiveFormat Detect(ReadOnlySpan<byte> data)
@@ -35,4 +45,64 @@ public static class ArchiveSignatureProbe
 
     private static bool StartsWith(ReadOnlySpan<byte> data, params byte[] signature) =>
         data.Length >= signature.Length && data[..signature.Length].SequenceEqual(signature);
+
+    private static (long Offset, long Length)? FindEmbeddedZip(FileStream stream)
+    {
+        if (stream.Length < ZipEndRecordLength) return null;
+
+        var tailLength = (int)Math.Min(stream.Length, ZipEndRecordLength + MaximumZipCommentLength);
+        var tailOffset = stream.Length - tailLength;
+        var tail = new byte[tailLength];
+        stream.Position = tailOffset;
+        stream.ReadExactly(tail);
+        Span<byte> centralDirectoryHeader = stackalloc byte[ZipCentralDirectoryHeaderLength];
+        Span<byte> localHeaderSignature = stackalloc byte[4];
+
+        for (var index = tail.Length - ZipEndRecordLength; index >= 0; index--)
+        {
+            var endRecord = tail.AsSpan(index);
+            if (!StartsWith(endRecord, 0x50, 0x4B, 0x05, 0x06)) continue;
+
+            var commentLength = BinaryPrimitives.ReadUInt16LittleEndian(endRecord[20..]);
+            var endRecordLength = ZipEndRecordLength + commentLength;
+            if (index + endRecordLength > tail.Length) continue;
+
+            var diskNumber = BinaryPrimitives.ReadUInt16LittleEndian(endRecord[4..]);
+            var centralDirectoryDisk = BinaryPrimitives.ReadUInt16LittleEndian(endRecord[6..]);
+            var entriesOnDisk = BinaryPrimitives.ReadUInt16LittleEndian(endRecord[8..]);
+            var totalEntries = BinaryPrimitives.ReadUInt16LittleEndian(endRecord[10..]);
+            if (diskNumber != 0 || centralDirectoryDisk != 0 || entriesOnDisk != totalEntries || totalEntries == 0) continue;
+
+            var centralDirectorySize = BinaryPrimitives.ReadUInt32LittleEndian(endRecord[12..]);
+            var centralDirectoryOffset = BinaryPrimitives.ReadUInt32LittleEndian(endRecord[16..]);
+            var endRecordOffset = tailOffset + index;
+            var archiveOffset = endRecordOffset - centralDirectorySize - centralDirectoryOffset;
+            if (archiveOffset <= 0) continue;
+
+            var centralDirectoryAbsoluteOffset = archiveOffset + centralDirectoryOffset;
+            if (centralDirectoryAbsoluteOffset < archiveOffset ||
+                centralDirectoryAbsoluteOffset + centralDirectorySize != endRecordOffset ||
+                centralDirectorySize < ZipCentralDirectoryHeaderLength)
+            {
+                continue;
+            }
+
+            stream.Position = centralDirectoryAbsoluteOffset;
+            stream.ReadExactly(centralDirectoryHeader);
+            if (!StartsWith(centralDirectoryHeader, 0x50, 0x4B, 0x01, 0x02)) continue;
+
+            var localHeaderOffset = BinaryPrimitives.ReadUInt32LittleEndian(centralDirectoryHeader[42..]);
+            var localHeaderAbsoluteOffset = archiveOffset + localHeaderOffset;
+            if (localHeaderAbsoluteOffset < archiveOffset || localHeaderAbsoluteOffset >= centralDirectoryAbsoluteOffset) continue;
+
+            stream.Position = localHeaderAbsoluteOffset;
+            stream.ReadExactly(localHeaderSignature);
+            if (StartsWith(localHeaderSignature, 0x50, 0x4B, 0x03, 0x04))
+            {
+                return (archiveOffset, endRecordOffset + endRecordLength - archiveOffset);
+            }
+        }
+
+        return null;
+    }
 }

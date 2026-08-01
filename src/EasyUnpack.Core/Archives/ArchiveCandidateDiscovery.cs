@@ -36,7 +36,10 @@ public static class ArchiveCandidateDiscovery
         {
             if (!wasDirectlySelected && ContainerExtensions.Contains(Path.GetExtension(path))) return;
             var result = ArchiveSignatureProbe.Probe(path);
-            if (result.IsArchive && seen.Add(Path.GetFullPath(path))) candidates.Add(new ArchiveCandidate(path, result.Format, wasDirectlySelected));
+            if (result.IsArchive && seen.Add(Path.GetFullPath(path)))
+            {
+                candidates.Add(new ArchiveCandidate(path, result.Format, wasDirectlySelected, result.ArchiveOffset, result.ArchiveLength));
+            }
         }
         catch (IOException)
         {

@@ -57,6 +57,21 @@ public sealed class ArchiveExtractionServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Extract_materializes_only_the_embedded_archive_range_for_the_engine()
+    {
+        var archivePath = Path.Combine(_directory, "video.mp4");
+        var payload = "embedded archive"u8.ToArray();
+        await File.WriteAllBytesAsync(archivePath, [.. "media prefix"u8, .. payload, .. "media trailer"u8]);
+        byte[]? engineInput = null;
+        var engine = new FakeEngine(inspectArchive: path => engineInput = File.ReadAllBytes(path));
+        var candidate = new ArchiveCandidate(archivePath, ArchiveFormat.Zip, true, "media prefix"u8.Length, payload.Length);
+
+        await new ArchiveExtractionService(engine, new RecordingRecycler()).ExtractAsync(candidate);
+
+        Assert.Equal(payload, engineInput);
+    }
+
+    [Fact]
     public async Task Extract_collapses_an_arbitrary_deep_single_directory_chain()
     {
         var archivePath = Path.Combine(_directory, "深层目录.rar");
@@ -131,13 +146,22 @@ public sealed class ArchiveExtractionServiceTests : IDisposable
     private sealed class FakeEngine : IArchiveEngine
     {
         private readonly Func<string, CancellationToken, Task>? _writeOutput;
+        private readonly Action<string>? _inspectArchive;
 
-        public FakeEngine(Func<string, CancellationToken, Task>? writeOutput = null) => _writeOutput = writeOutput;
+        public FakeEngine(Func<string, CancellationToken, Task>? writeOutput = null, Action<string>? inspectArchive = null)
+        {
+            _writeOutput = writeOutput;
+            _inspectArchive = inspectArchive;
+        }
 
         public ArchiveEngineDescriptor Descriptor { get; } = new(ArchiveEngineKind.SevenZip, "fake.exe", "test");
 
         public Task<EngineExecutionResult> ListAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(Success());
-        public Task<EngineExecutionResult> TestAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(Success());
+        public Task<EngineExecutionResult> TestAsync(string archivePath, CancellationToken cancellationToken = default)
+        {
+            _inspectArchive?.Invoke(archivePath);
+            return Task.FromResult(Success());
+        }
 
         public async Task<EngineExecutionResult> ExtractAsync(string archivePath, string destinationDirectory, CancellationToken cancellationToken = default)
         {

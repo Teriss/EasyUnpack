@@ -32,7 +32,7 @@ public sealed partial class ArchiveExtractionService
         try
         {
             Directory.CreateDirectory(extractionDirectory);
-            var engineArchivePath = PrepareEngineArchivePath(volumes, workingDirectory);
+            var engineArchivePath = await PrepareEngineArchivePathAsync(candidate, volumes, workingDirectory, cancellationToken).ConfigureAwait(false);
             var password = await FindWorkingPasswordAsync(engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
             var extraction = password is null
                 ? await _engine.ExtractAsync(engineArchivePath, extractionDirectory, cancellationToken).ConfigureAwait(false)
@@ -92,7 +92,7 @@ public sealed partial class ArchiveExtractionService
             var volumes = ArchiveVolumeResolver.Resolve(candidate);
             if (!volumes.IsComplete) throw new InvalidDataException(volumes.IncompleteReason);
             Directory.CreateDirectory(nestedContentsDirectory);
-            var engineArchivePath = PrepareEngineArchivePath(volumes, nestedWorkingDirectory);
+            var engineArchivePath = await PrepareEngineArchivePathAsync(candidate, volumes, nestedWorkingDirectory, cancellationToken).ConfigureAwait(false);
             var password = await FindWorkingPasswordAsync(engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
             var extraction = password is null
                 ? await _engine.ExtractAsync(engineArchivePath, nestedContentsDirectory, cancellationToken).ConfigureAwait(false)
@@ -135,8 +135,58 @@ public sealed partial class ArchiveExtractionService
         throw new ArchivePasswordRequiredException(archivePath, attempted);
     }
 
-    private static string PrepareEngineArchivePath(ArchiveVolumeSet volumes, string workingDirectory)
+    private static async Task<string> PrepareEngineArchivePathAsync(
+        ArchiveCandidate candidate,
+        ArchiveVolumeSet volumes,
+        string workingDirectory,
+        CancellationToken cancellationToken)
     {
+        if (candidate.ArchiveOffset > 0)
+        {
+            if (volumes.SourcePaths.Count != 1 || !string.Equals(volumes.PrimaryPath, candidate.Path, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException("An embedded archive cannot be combined with a multi-volume archive set.");
+            }
+
+            var sourceLength = new FileInfo(candidate.Path).Length;
+            if (candidate.ArchiveLength <= 0 ||
+                candidate.ArchiveOffset >= sourceLength ||
+                candidate.ArchiveLength > sourceLength - candidate.ArchiveOffset)
+            {
+                throw new InvalidDataException("The embedded archive range is outside the source file.");
+            }
+
+            var embeddedDirectory = Path.Combine(workingDirectory, "embedded-archive");
+            Directory.CreateDirectory(embeddedDirectory);
+            var embeddedPath = Path.Combine(embeddedDirectory, candidate.Format == ArchiveFormat.Zip ? "payload.zip" : "payload.bin");
+            await using var source = new FileStream(
+                candidate.Path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 1024 * 1024,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            source.Position = candidate.ArchiveOffset;
+            await using var destination = new FileStream(
+                embeddedPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize: 1024 * 1024,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            var buffer = GC.AllocateUninitializedArray<byte>(1024 * 1024);
+            var remaining = candidate.ArchiveLength;
+            while (remaining > 0)
+            {
+                var count = await source.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), cancellationToken).ConfigureAwait(false);
+                if (count == 0) throw new EndOfStreamException("The source file ended before the embedded archive was copied.");
+                await destination.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
+                remaining -= count;
+            }
+            await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
+            return embeddedPath;
+        }
+
         if (volumes.CanonicalNames.Count == 0) return volumes.PrimaryPath;
 
         var aliasDirectory = Path.Combine(workingDirectory, "volume-aliases");

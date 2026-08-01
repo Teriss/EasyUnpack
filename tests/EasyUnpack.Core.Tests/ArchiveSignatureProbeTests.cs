@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using EasyUnpack.Core.Archives;
 
 namespace EasyUnpack.Core.Tests;
@@ -32,5 +33,59 @@ public sealed class ArchiveSignatureProbeTests
         "ustar"u8.CopyTo(bytes.AsSpan(257));
 
         Assert.Equal(ArchiveFormat.Tar, ArchiveSignatureProbe.Detect(bytes));
+    }
+
+    [Fact]
+    public void Probe_recognizes_a_zip_appended_to_non_archive_data()
+    {
+        var prefix = "ordinary media prefix"u8.ToArray();
+        var path = Path.GetTempFileName();
+        try
+        {
+            var zip = CreateZipBytes();
+            File.WriteAllBytes(path, [.. prefix, .. zip, .. "media trailer"u8]);
+
+            var result = ArchiveSignatureProbe.Probe(path);
+
+            Assert.Equal(ArchiveFormat.Zip, result.Format);
+            Assert.True(result.HasKnownSignature);
+            Assert.Equal(prefix.Length, result.ArchiveOffset);
+            Assert.Equal(zip.Length, result.ArchiveLength);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void Probe_rejects_an_unstructured_zip_end_marker()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllBytes(path, [.. "ordinary media prefix"u8, 0x50, 0x4B, 0x05, 0x06, .. new byte[18]]);
+
+            var result = ArchiveSignatureProbe.Probe(path);
+
+            Assert.Equal(ArchiveFormat.Unknown, result.Format);
+            Assert.Equal(0, result.ArchiveOffset);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    private static byte[] CreateZipBytes()
+    {
+        using var buffer = new MemoryStream();
+        using (var archive = new ZipArchive(buffer, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            var entry = archive.CreateEntry("content.txt");
+            using var writer = new StreamWriter(entry.Open());
+            writer.Write("content");
+        }
+        return buffer.ToArray();
     }
 }

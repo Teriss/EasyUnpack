@@ -10,3 +10,5 @@ Discovery recognizes 7-Zip, NanaZip, WinRAR, Bandizip, PeaZip, WinZip, HaoZip, a
 
 The 7-Zip adapter always closes standard input for password-free probes so an encrypted archive cannot leave a hidden console prompt waiting indefinitely. Password-bearing commands are never included in application logs or surfaced through task status.
 WinZip, HaoZip, and 360 compression are currently detection-only because no complete, tested command-line adapter is registered for them. Automatic extraction selects only a verified adapter.
+
+ZIP payloads embedded near the end of another file are detected from their end-of-central-directory and central-directory structure. The payload byte range remains core metadata; before an adapter is invoked, orchestration copies that range into the job staging directory under a canonical `.zip` name. This temporary normalization never modifies the selected source, and the source remains eligible for recycling only after extraction output has been published successfully.

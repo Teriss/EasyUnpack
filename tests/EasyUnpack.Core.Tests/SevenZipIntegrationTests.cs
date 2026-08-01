@@ -40,6 +40,36 @@ public sealed class SevenZipIntegrationTests : IDisposable
 
     [Fact]
     [Trait("Category", "Integration")]
+    public async Task SevenZip_extracts_a_zip_appended_to_a_media_file()
+    {
+        var descriptor = ArchiveEngineDiscovery.FindAvailable().FirstOrDefault(engine => engine.Kind == ArchiveEngineKind.SevenZip);
+        if (descriptor is null) return;
+
+        var archivePath = Path.Combine(_directory, "video.mp4");
+        var prefix = "fake mp4 payload"u8.ToArray();
+        using var buffer = new MemoryStream();
+        using (var archive = new ZipArchive(buffer, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            var entry = archive.CreateEntry("wrapper/content.txt");
+            await using var writer = new StreamWriter(entry.Open());
+            await writer.WriteAsync("content");
+        }
+        var zip = buffer.ToArray();
+        await File.WriteAllBytesAsync(archivePath, [.. prefix, .. zip, .. "fake mp4 trailer"u8]);
+
+        var candidate = Assert.Single(ArchiveCandidateDiscovery.Discover([archivePath]));
+        Assert.Equal(prefix.Length, candidate.ArchiveOffset);
+        Assert.Equal(zip.Length, candidate.ArchiveLength);
+        var recycler = new RecordingRecycler();
+
+        var result = await new ArchiveExtractionService(new SevenZipEngine(descriptor), recycler).ExtractAsync(candidate);
+
+        Assert.True(File.Exists(Path.Combine(result.OutputDirectory, "content.txt")));
+        Assert.Equal([archivePath], recycler.Paths);
+    }
+
+    [Fact]
+    [Trait("Category", "Integration")]
     public async Task SevenZip_extracts_disguised_split_volumes_through_temporary_canonical_names()
     {
         var descriptor = ArchiveEngineDiscovery.FindAvailable().FirstOrDefault(engine => engine.Kind == ArchiveEngineKind.SevenZip);
