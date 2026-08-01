@@ -1,5 +1,5 @@
 #define AppName "EasyUnpack"
-#define AppVersion "1.0.2"
+#define AppVersion "1.0.3"
 #define AppPublisher "EasyUnpack"
 #define AppExeName "EasyUnpack.App.exe"
 #define ShellClsid "{{A7B99305-3DA8-4EAB-965E-72070CDBA1A8}"
