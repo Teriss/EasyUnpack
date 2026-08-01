@@ -31,4 +31,10 @@ The extraction password dialog uses a fixed 240-pixel window with a star-sized p
 
 - `dotnet test EasyUnpack.slnx --configuration Release`: 62 passed, 0 failed.
 - `dotnet build EasyUnpack.slnx --configuration Release`: 0 warnings, 0 errors.
-- Initial installer and local installation checks succeeded; the final release artifact will be rebuilt from the release commit so its informational version contains the matching commit hash.
+- Final installer version: 1.0.2; size: 46,452,238 bytes; SHA-256: `65768DDC7AE235374C6854AC91AE97082D12E07079AF239BBAFC42425FFA6ED0`.
+- Installed application version: `1.0.2+a7514e4594a23a00e0795913ed79a2e892cabdcf`; the installed DLL matches the release build.
+- Explorer was restarted successfully; file and directory menu text and the registered shell-extension path were verified.
+- Test-created temporary directories and installer logs are absent.
+- Commit `a7514e4`, remote `main`, and annotated tag `v1.0.2` point to the release source.
+- GitHub Release `EasyUnpack 1.0.2` is public with `EasyUnpack-Setup.exe` in the `uploaded` state.
+- Anonymous verification confirmed the UTF-8 Chinese release text, tag target, asset metadata, and a 1,024-byte HTTP 206 range download.
