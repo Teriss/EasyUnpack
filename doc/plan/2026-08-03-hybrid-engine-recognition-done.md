@@ -21,3 +21,12 @@
 - Keep version 1.0.3, commit and push the final implementation, replace the existing local and remote `v1.0.3` tag, and publish the installer in a public GitHub Release.
 - Verify the public tag, UTF-8 release metadata, asset state, size, hash, and anonymous download.
 - Never expose archive passwords or GitHub credentials, and never modify, extract, move, or recycle the supplied source sample.
+
+## Verification Results
+
+- Release tests passed: 75 passed, 0 failed; Release build completed with 0 warnings and 0 errors.
+- The supplied 6,031,102,583-byte sample was probed read-only as ZIP at offset `915459573` with length `5115624562`.
+- Installed application version: `1.0.3+60c8dd6a37b89dd7cd3a08cfe7e8b45f0978cd61`; shell registration and installed UI startup were verified.
+- Installer size: 46,476,913 bytes; SHA-256: `39DEF414A401FB66AE57E05D02B8BE19B757513E0F7B1524DB7B194B56C01756`.
+- Commit `60c8dd6` and the recreated `v1.0.3` tag were pushed. The public `EasyUnpack 1.0.3` Release contains the uploaded installer, valid UTF-8 Chinese text, and an anonymously verified HTTP 206 byte range.
+- Test diagnostics, the isolated UI data directory, and installer logs created by this work were removed. The unrelated user-owned untracked plan file was not modified or committed.
