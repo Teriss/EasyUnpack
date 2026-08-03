@@ -23,13 +23,14 @@ public partial class MainWindow : Window
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
         var settings = await EasyUnpackSettingsStore.LoadAsync(ApplicationStorage.SettingsPath);
-        var scan = await Task.Run(() => ArchiveCandidateDiscovery.Discover(_inputPaths));
-        var engines = await Task.Run(() => ArchiveEngineDiscovery.FindAvailable(settings.EnginePaths));
+        var descriptors = await Task.Run(() => ArchiveEngineDiscovery.FindAvailable(settings.EnginePaths));
+        var engines = ArchiveEngineFactory.CreateAll(descriptors, settings.PreferredEngine);
+        var scan = await ArchiveCandidateDiscovery.DiscoverAsync(_inputPaths, engines);
         var tasks = scan.Select(candidate => new CandidateTaskItem(candidate)).ToList();
 
         CandidateGrid.ItemsSource = tasks;
-        var engine = ArchiveEngineFactory.CreatePreferred(engines, settings.PreferredEngine);
-        var availableNames = engines
+        var engine = engines.FirstOrDefault();
+        var availableNames = descriptors
             .Where(descriptor => ArchiveEngineFactory.IsSupported(descriptor.Kind))
             .Select(descriptor => descriptor.DisplayName)
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -41,7 +42,7 @@ public partial class MainWindow : Window
             case 0:
                 SetStatus("没有发现可处理的压缩包。请检查文件是否完整，或在引擎设置中确认解压工具。", StatusTone.Warning);
                 break;
-            case var _ when engine is null && engines.Count > 0:
+            case var _ when engine is null && descriptors.Count > 0:
                 SetStatus($"发现 {scan.Count} 个压缩包，但检测到的工具暂不具备可用适配器。请安装或配置 7-Zip、WinRAR 或 Bandizip。", StatusTone.Warning);
                 break;
             case var _ when engine is null:
@@ -52,14 +53,14 @@ public partial class MainWindow : Window
                 break;
         }
 
-        if (tasks.Count > 0 && engine is not null) await ProcessCandidatesAsync(tasks, engine);
+        if (tasks.Count > 0 && engines.Count > 0) await ProcessCandidatesAsync(tasks, engines);
     }
 
     private void OpenSettings_Click(object sender, RoutedEventArgs e) => new SettingsWindow { Owner = this }.ShowDialog();
 
     private void OpenPasswordVault_Click(object sender, RoutedEventArgs e) => new PasswordVaultWindow { Owner = this }.ShowDialog();
 
-    private async Task ProcessCandidatesAsync(IReadOnlyList<CandidateTaskItem> candidates, IArchiveEngine engine)
+    private async Task ProcessCandidatesAsync(IReadOnlyList<CandidateTaskItem> candidates, IReadOnlyList<IArchiveEngine> engines)
     {
         PasswordVault vault;
         string? masterPassword = null;
@@ -93,7 +94,7 @@ public partial class MainWindow : Window
             SetStatus("密码库无法打开，本次运行中输入的新密码不会被保存。", StatusTone.Warning);
         }
 
-        var service = new ArchiveExtractionService(engine, new WindowsArchiveSourceRecycler());
+        var service = new ArchiveExtractionService(engines, new WindowsArchiveSourceRecycler());
         var succeeded = 0;
         var failed = 0;
         var warnings = 0;

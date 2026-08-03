@@ -1,9 +1,9 @@
-using System.Diagnostics;
-
 namespace EasyUnpack.Core.Engines;
 
 public sealed class WinRarEngine : IPasswordArchiveEngine
 {
+    private static readonly TimeSpan RecognitionTimeout = TimeSpan.FromSeconds(30);
+
     public WinRarEngine(ArchiveEngineDescriptor descriptor)
     {
         ArgumentNullException.ThrowIfNull(descriptor);
@@ -12,6 +12,12 @@ public sealed class WinRarEngine : IPasswordArchiveEngine
     }
 
     public ArchiveEngineDescriptor Descriptor { get; }
+
+    public Task<ArchiveRecognitionResult> RecognizeAsync(string archivePath, CancellationToken cancellationToken = default) =>
+        RecognizeWithTimeoutAsync(["l", "-idq", archivePath], cancellationToken);
+
+    public async Task<ArchiveRecognitionResult> ValidateAsync(string archivePath, CancellationToken cancellationToken = default) =>
+        ArchiveEngineResultClassifier.Classify(await TestAsync(archivePath, cancellationToken).ConfigureAwait(false), validation: true);
 
     public Task<EngineExecutionResult> ListAsync(string archivePath, CancellationToken cancellationToken = default) =>
         RunAsync(["l", "-idq", archivePath], cancellationToken);
@@ -30,22 +36,22 @@ public sealed class WinRarEngine : IPasswordArchiveEngine
 
     private async Task<EngineExecutionResult> RunAsync(IReadOnlyList<string> arguments, CancellationToken cancellationToken)
     {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = Descriptor.ExecutablePath,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
-        foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
+        return await ArchiveEngineProcessRunner.RunAsync(Descriptor.ExecutablePath, arguments, cancellationToken).ConfigureAwait(false);
+    }
 
-        using var process = new Process { StartInfo = startInfo };
-        process.Start();
-        var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
-        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-        return new EngineExecutionResult(process.ExitCode == 0, process.ExitCode, await outputTask.ConfigureAwait(false), await errorTask.ConfigureAwait(false));
+    private async Task<ArchiveRecognitionResult> RecognizeWithTimeoutAsync(IReadOnlyList<string> arguments, CancellationToken cancellationToken)
+    {
+        using var timeout = new CancellationTokenSource(RecognitionTimeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+        try
+        {
+            var result = await RunAsync(arguments, linked.Token).ConfigureAwait(false);
+            return ArchiveEngineResultClassifier.Classify(result, validation: false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return new ArchiveRecognitionResult(ArchiveRecognitionStatus.UnsupportedOrCorrupt);
+        }
     }
 
     private static string EnsureDirectorySuffix(string path) => path.EndsWith(Path.DirectorySeparatorChar) ? path : path + Path.DirectorySeparatorChar;

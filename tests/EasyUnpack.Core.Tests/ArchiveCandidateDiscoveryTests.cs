@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using EasyUnpack.Core.Archives;
+using EasyUnpack.Core.Engines;
 
 namespace EasyUnpack.Core.Tests;
 
@@ -55,8 +56,66 @@ public sealed class ArchiveCandidateDiscoveryTests : IDisposable
         Assert.Equal(zip.Length, candidate.ArchiveLength);
     }
 
+    [Fact]
+    public async Task DiscoverAsync_uses_engines_only_for_directly_selected_unknown_files()
+    {
+        var direct = Path.Combine(_directory, "unknown.mp4");
+        await File.WriteAllTextAsync(direct, "engine-owned format");
+        var engine = new RecognitionEngine(ArchiveRecognitionStatus.Recognized, ArchiveFormat.EngineDetected);
+
+        var directCandidates = await ArchiveCandidateDiscovery.DiscoverAsync([direct], [engine]);
+
+        var candidate = Assert.Single(directCandidates);
+        Assert.Equal(ArchiveFormat.EngineDetected, candidate.Format);
+        Assert.Equal(engine.Descriptor.Kind, candidate.RecognitionEngineKind);
+        Assert.Equal(1, engine.RecognitionCalls);
+
+        engine.Reset();
+        Assert.Empty(await ArchiveCandidateDiscovery.DiscoverAsync([_directory], [engine]));
+        Assert.Equal(0, engine.RecognitionCalls);
+    }
+
+    [Fact]
+    public async Task DiscoverAsync_falls_back_to_the_next_engine_in_order()
+    {
+        var path = Path.Combine(_directory, "unknown.data");
+        await File.WriteAllTextAsync(path, "engine-owned format");
+        var first = new RecognitionEngine(ArchiveRecognitionStatus.NotArchive, ArchiveFormat.Unknown, ArchiveEngineKind.SevenZip);
+        var second = new RecognitionEngine(ArchiveRecognitionStatus.PasswordRequired, ArchiveFormat.Rar, ArchiveEngineKind.WinRar);
+
+        var candidate = Assert.Single(await ArchiveCandidateDiscovery.DiscoverAsync([path], [first, second]));
+
+        Assert.Equal(1, first.RecognitionCalls);
+        Assert.Equal(1, second.RecognitionCalls);
+        Assert.Equal(ArchiveFormat.Rar, candidate.Format);
+        Assert.Equal(ArchiveEngineKind.WinRar, candidate.RecognitionEngineKind);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_directory)) Directory.Delete(_directory, recursive: true);
+    }
+
+    private sealed class RecognitionEngine(
+        ArchiveRecognitionStatus status,
+        ArchiveFormat format,
+        ArchiveEngineKind kind = ArchiveEngineKind.SevenZip) : IArchiveEngine
+    {
+        public int RecognitionCalls { get; private set; }
+        public ArchiveEngineDescriptor Descriptor { get; } = new(kind, "fake.exe", "test");
+
+        public void Reset() => RecognitionCalls = 0;
+
+        public Task<ArchiveRecognitionResult> RecognizeAsync(string archivePath, CancellationToken cancellationToken = default)
+        {
+            RecognitionCalls++;
+            return Task.FromResult(new ArchiveRecognitionResult(status, format));
+        }
+
+        public Task<ArchiveRecognitionResult> ValidateAsync(string archivePath, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ArchiveRecognitionResult(status, format));
+        public Task<EngineExecutionResult> ListAsync(string archivePath, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<EngineExecutionResult> TestAsync(string archivePath, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<EngineExecutionResult> ExtractAsync(string archivePath, string destinationDirectory, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 }

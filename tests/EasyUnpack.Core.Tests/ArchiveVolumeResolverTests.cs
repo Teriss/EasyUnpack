@@ -67,6 +67,18 @@ public sealed class ArchiveVolumeResolverTests : IDisposable
         Assert.Equal("work.7z.002", set.CanonicalNames[paths[1]]);
     }
 
+    [Fact]
+    public void Resolve_treats_a_generic_engine_detected_format_as_one_volume()
+    {
+        var paths = CreateFiles("work.001.jpg", "work.002.jpg");
+
+        var set = ArchiveVolumeResolver.Resolve(new ArchiveCandidate(paths[0], ArchiveFormat.EngineDetected, true));
+
+        Assert.True(set.IsComplete);
+        Assert.Equal([paths[0]], set.SourcePaths);
+        Assert.Empty(set.CanonicalNames);
+    }
+
     private string[] CreateFiles(params string[] names)
     {
         return names.Select(name =>

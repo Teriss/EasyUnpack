@@ -72,6 +72,54 @@ public sealed class ArchiveExtractionServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Extract_reuses_one_embedded_staging_path_for_recognition_validation_and_extraction()
+    {
+        var archivePath = Path.Combine(_directory, "video-reuse.mp4");
+        var payload = "embedded archive"u8.ToArray();
+        await File.WriteAllBytesAsync(archivePath, [.. "prefix"u8, .. payload, .. "trailer"u8]);
+        var engine = new PathRecordingEngine();
+
+        await new ArchiveExtractionService(engine, new RecordingRecycler()).ExtractAsync(
+            new ArchiveCandidate(archivePath, ArchiveFormat.Zip, true, "prefix"u8.Length, payload.Length));
+
+        Assert.Equal(3, engine.Paths.Count);
+        Assert.Single(engine.Paths.Distinct(StringComparer.OrdinalIgnoreCase));
+        Assert.Equal(payload, engine.BytesSeen);
+    }
+
+    [Fact]
+    public async Task Extract_falls_back_when_the_first_engine_cannot_validate()
+    {
+        var archivePath = Path.Combine(_directory, "fallback.rar");
+        await File.WriteAllBytesAsync(archivePath, Convert.FromHexString("526172211A0700"));
+        var first = new StatusEngine(ArchiveEngineKind.SevenZip, ArchiveRecognitionStatus.UnsupportedOrCorrupt);
+        var second = new StatusEngine(ArchiveEngineKind.WinRar, ArchiveRecognitionStatus.Recognized);
+
+        var result = await new ArchiveExtractionService([first, second], new RecordingRecycler())
+            .ExtractAsync(new ArchiveCandidate(archivePath, ArchiveFormat.Rar, true));
+
+        Assert.Equal(0, first.ExtractionCalls);
+        Assert.Equal(1, second.ExtractionCalls);
+        Assert.True(File.Exists(Path.Combine(result.OutputDirectory, "file.txt")));
+    }
+
+    [Fact]
+    public async Task Extract_preserves_source_when_no_engine_can_validate()
+    {
+        var archivePath = Path.Combine(_directory, "corrupt.rar");
+        await File.WriteAllBytesAsync(archivePath, Convert.FromHexString("526172211A0700"));
+        var recycler = new RecordingRecycler();
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new ArchiveExtractionService(new StatusEngine(ArchiveEngineKind.SevenZip, ArchiveRecognitionStatus.UnsupportedOrCorrupt), recycler)
+                .ExtractAsync(new ArchiveCandidate(archivePath, ArchiveFormat.Rar, true)));
+
+        Assert.True(File.Exists(archivePath));
+        Assert.Empty(recycler.Paths);
+        Assert.False(Directory.Exists(Path.Combine(_directory, "corrupt")));
+    }
+
+    [Fact]
     public async Task Extract_collapses_an_arbitrary_deep_single_directory_chain()
     {
         var archivePath = Path.Combine(_directory, "深层目录.rar");
@@ -156,10 +204,18 @@ public sealed class ArchiveExtractionServiceTests : IDisposable
 
         public ArchiveEngineDescriptor Descriptor { get; } = new(ArchiveEngineKind.SevenZip, "fake.exe", "test");
 
+        public Task<ArchiveRecognitionResult> RecognizeAsync(string archivePath, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ArchiveRecognitionResult(ArchiveRecognitionStatus.Recognized, ArchiveFormat.Rar));
+
+        public Task<ArchiveRecognitionResult> ValidateAsync(string archivePath, CancellationToken cancellationToken = default)
+        {
+            _inspectArchive?.Invoke(archivePath);
+            return Task.FromResult(new ArchiveRecognitionResult(ArchiveRecognitionStatus.Recognized, ArchiveFormat.Rar));
+        }
+
         public Task<EngineExecutionResult> ListAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(Success());
         public Task<EngineExecutionResult> TestAsync(string archivePath, CancellationToken cancellationToken = default)
         {
-            _inspectArchive?.Invoke(archivePath);
             return Task.FromResult(Success());
         }
 
@@ -173,6 +229,57 @@ public sealed class ArchiveExtractionServiceTests : IDisposable
 
             var wrapped = Directory.CreateDirectory(Path.Combine(destinationDirectory, "RI10003"));
             await File.WriteAllTextAsync(Path.Combine(wrapped.FullName, "file.txt"), "content", cancellationToken);
+            return Success();
+        }
+
+        private static EngineExecutionResult Success() => new(true, 0, string.Empty, string.Empty);
+    }
+
+    private sealed class PathRecordingEngine : IArchiveEngine
+    {
+        public List<string> Paths { get; } = [];
+        public byte[]? BytesSeen { get; private set; }
+        public ArchiveEngineDescriptor Descriptor { get; } = new(ArchiveEngineKind.SevenZip, "fake.exe", "test");
+
+        public Task<ArchiveRecognitionResult> RecognizeAsync(string archivePath, CancellationToken cancellationToken = default)
+        {
+            Paths.Add(archivePath);
+            BytesSeen = File.ReadAllBytes(archivePath);
+            return Task.FromResult(new ArchiveRecognitionResult(ArchiveRecognitionStatus.Recognized, ArchiveFormat.Zip));
+        }
+
+        public Task<ArchiveRecognitionResult> ValidateAsync(string archivePath, CancellationToken cancellationToken = default)
+        {
+            Paths.Add(archivePath);
+            return Task.FromResult(new ArchiveRecognitionResult(ArchiveRecognitionStatus.Recognized, ArchiveFormat.Zip));
+        }
+
+        public Task<EngineExecutionResult> ListAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(Success());
+        public Task<EngineExecutionResult> TestAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(Success());
+        public async Task<EngineExecutionResult> ExtractAsync(string archivePath, string destinationDirectory, CancellationToken cancellationToken = default)
+        {
+            Paths.Add(archivePath);
+            await File.WriteAllTextAsync(Path.Combine(destinationDirectory, "file.txt"), "content", cancellationToken);
+            return Success();
+        }
+
+        private static EngineExecutionResult Success() => new(true, 0, string.Empty, string.Empty);
+    }
+
+    private sealed class StatusEngine(ArchiveEngineKind kind, ArchiveRecognitionStatus validationStatus) : IArchiveEngine
+    {
+        public int ExtractionCalls { get; private set; }
+        public ArchiveEngineDescriptor Descriptor { get; } = new(kind, "fake.exe", "test");
+        public Task<ArchiveRecognitionResult> RecognizeAsync(string archivePath, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ArchiveRecognitionResult(ArchiveRecognitionStatus.Recognized, ArchiveFormat.Rar));
+        public Task<ArchiveRecognitionResult> ValidateAsync(string archivePath, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ArchiveRecognitionResult(validationStatus, ArchiveFormat.Rar));
+        public Task<EngineExecutionResult> ListAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(Success());
+        public Task<EngineExecutionResult> TestAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(Success());
+        public async Task<EngineExecutionResult> ExtractAsync(string archivePath, string destinationDirectory, CancellationToken cancellationToken = default)
+        {
+            ExtractionCalls++;
+            await File.WriteAllTextAsync(Path.Combine(destinationDirectory, "file.txt"), "content", cancellationToken);
             return Success();
         }
 

@@ -3,6 +3,7 @@ namespace EasyUnpack.Core.Archives;
 public enum ArchiveFormat
 {
     Unknown,
+    EngineDetected,
     SevenZip,
     Rar,
     Rar5,

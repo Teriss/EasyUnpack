@@ -145,9 +145,11 @@ public sealed class SevenZipIntegrationTests : IDisposable
         var engine = new SevenZipEngine(descriptor);
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var withoutPassword = await engine.TestAsync(archivePath, timeout.Token);
+        var validation = await engine.ValidateAsync(archivePath, timeout.Token);
         var withPassword = await engine.TestWithPasswordAsync(archivePath, password, timeout.Token);
 
         Assert.False(withoutPassword.Succeeded);
+        Assert.Equal(ArchiveRecognitionStatus.PasswordRequired, validation.Status);
         Assert.True(withPassword.Succeeded);
     }
 

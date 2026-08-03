@@ -9,6 +9,9 @@ public static class ArchiveEngineFactory
         ArchiveEngineKind.Bandizip;
 
     public static IArchiveEngine? CreatePreferred(IReadOnlyList<ArchiveEngineDescriptor> descriptors, ArchiveEngineKind? preferredEngine = null)
+        => CreateAll(descriptors, preferredEngine).FirstOrDefault();
+
+    public static IReadOnlyList<IArchiveEngine> CreateAll(IReadOnlyList<ArchiveEngineDescriptor> descriptors, ArchiveEngineKind? preferredEngine = null)
     {
         ArgumentNullException.ThrowIfNull(descriptors);
 
@@ -16,21 +19,25 @@ public static class ArchiveEngineFactory
             ? descriptors.OrderBy(static descriptor => GetPriority(descriptor.Kind))
             : descriptors.OrderBy(descriptor => descriptor.Kind == preferredEngine ? 0 : GetPriority(descriptor.Kind));
 
+        var engines = new List<IArchiveEngine>();
         foreach (var descriptor in ordered)
         {
             switch (descriptor.Kind)
             {
                 case ArchiveEngineKind.SevenZip:
                 case ArchiveEngineKind.NanaZip:
-                    return new SevenZipEngine(descriptor);
+                    engines.Add(new SevenZipEngine(descriptor));
+                    break;
                 case ArchiveEngineKind.WinRar:
-                    return new WinRarEngine(descriptor);
+                    engines.Add(new WinRarEngine(descriptor));
+                    break;
                 case ArchiveEngineKind.Bandizip:
-                    return new BandizipEngine(descriptor);
+                    engines.Add(new BandizipEngine(descriptor));
+                    break;
             }
         }
 
-        return null;
+        return engines;
     }
 
     private static int GetPriority(ArchiveEngineKind kind) => kind switch

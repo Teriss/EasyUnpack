@@ -45,6 +45,10 @@ public sealed class ArchivePasswordFlowTests : IDisposable
     {
         public string? ExtractionPassword { get; private set; }
         public ArchiveEngineDescriptor Descriptor { get; } = new(ArchiveEngineKind.SevenZip, "fake.exe", "test");
+        public Task<ArchiveRecognitionResult> RecognizeAsync(string archivePath, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ArchiveRecognitionResult(ArchiveRecognitionStatus.Recognized, ArchiveFormat.Rar));
+        public Task<ArchiveRecognitionResult> ValidateAsync(string archivePath, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ArchiveRecognitionResult(ArchiveRecognitionStatus.PasswordRequired, ArchiveFormat.Rar));
         public Task<EngineExecutionResult> ListAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(Failure());
         public Task<EngineExecutionResult> TestAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(Failure());
         public Task<EngineExecutionResult> TestWithPasswordAsync(string archivePath, string password, CancellationToken cancellationToken = default) => Task.FromResult(password == correctPassword ? Success() : Failure());

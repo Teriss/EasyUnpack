@@ -7,12 +7,20 @@ namespace EasyUnpack.Core.Extraction;
 
 public sealed partial class ArchiveExtractionService
 {
-    private readonly IArchiveEngine _engine;
+    private readonly IReadOnlyList<IArchiveEngine> _engines;
     private readonly IArchiveSourceRecycler _recycler;
 
     public ArchiveExtractionService(IArchiveEngine engine, IArchiveSourceRecycler recycler)
+        : this([engine], recycler)
     {
-        _engine = engine;
+    }
+
+    public ArchiveExtractionService(IReadOnlyList<IArchiveEngine> engines, IArchiveSourceRecycler recycler)
+    {
+        ArgumentNullException.ThrowIfNull(engines);
+        ArgumentNullException.ThrowIfNull(recycler);
+        if (engines.Count == 0) throw new ArgumentException("At least one archive engine is required.", nameof(engines));
+        _engines = engines;
         _recycler = recycler;
     }
 
@@ -33,11 +41,11 @@ public sealed partial class ArchiveExtractionService
         {
             Directory.CreateDirectory(extractionDirectory);
             var engineArchivePath = await PrepareEngineArchivePathAsync(candidate, volumes, workingDirectory, cancellationToken).ConfigureAwait(false);
-            var password = await FindWorkingPasswordAsync(engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
-            var extraction = password is null
-                ? await _engine.ExtractAsync(engineArchivePath, extractionDirectory, cancellationToken).ConfigureAwait(false)
-                : await ((IPasswordArchiveEngine)_engine).ExtractWithPasswordAsync(engineArchivePath, extractionDirectory, password, cancellationToken).ConfigureAwait(false);
-            if (!extraction.Succeeded) throw new InvalidDataException($"{_engine.Descriptor.DisplayName} could not extract the archive.");
+            var selection = await SelectEngineAsync(candidate, engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
+            var extraction = selection.Password is null
+                ? await selection.Engine.ExtractAsync(engineArchivePath, extractionDirectory, cancellationToken).ConfigureAwait(false)
+                : await ((IPasswordArchiveEngine)selection.Engine).ExtractWithPasswordAsync(engineArchivePath, extractionDirectory, selection.Password, cancellationToken).ConfigureAwait(false);
+            if (!extraction.Succeeded) throw new InvalidDataException($"{selection.Engine.Descriptor.DisplayName} could not extract the archive.");
 
             await ProcessNestedArchivesAsync(extractionDirectory, workingDirectory, consumedDirectory, passwords, cancellationToken).ConfigureAwait(false);
             NormalizeOutputTree(extractionDirectory, cancellationToken);
@@ -93,11 +101,11 @@ public sealed partial class ArchiveExtractionService
             if (!volumes.IsComplete) throw new InvalidDataException(volumes.IncompleteReason);
             Directory.CreateDirectory(nestedContentsDirectory);
             var engineArchivePath = await PrepareEngineArchivePathAsync(candidate, volumes, nestedWorkingDirectory, cancellationToken).ConfigureAwait(false);
-            var password = await FindWorkingPasswordAsync(engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
-            var extraction = password is null
-                ? await _engine.ExtractAsync(engineArchivePath, nestedContentsDirectory, cancellationToken).ConfigureAwait(false)
-                : await ((IPasswordArchiveEngine)_engine).ExtractWithPasswordAsync(engineArchivePath, nestedContentsDirectory, password, cancellationToken).ConfigureAwait(false);
-            if (!extraction.Succeeded) throw new InvalidDataException($"{_engine.Descriptor.DisplayName} could not extract nested archive {candidate.Path}.");
+            var selection = await SelectEngineAsync(candidate, engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
+            var extraction = selection.Password is null
+                ? await selection.Engine.ExtractAsync(engineArchivePath, nestedContentsDirectory, cancellationToken).ConfigureAwait(false)
+                : await ((IPasswordArchiveEngine)selection.Engine).ExtractWithPasswordAsync(engineArchivePath, nestedContentsDirectory, selection.Password, cancellationToken).ConfigureAwait(false);
+            if (!extraction.Succeeded) throw new InvalidDataException($"{selection.Engine.Descriptor.DisplayName} could not extract nested archive {candidate.Path}.");
 
             NormalizeOutputTree(nestedContentsDirectory, cancellationToken);
             var targetDirectory = ReserveTargetDirectory(Path.GetDirectoryName(candidate.Path)!, candidate.LogicalName);
@@ -114,26 +122,62 @@ public sealed partial class ArchiveExtractionService
         }
     }
 
-    private async Task<string?> FindWorkingPasswordAsync(string archivePath, IReadOnlyList<string>? passwords, CancellationToken cancellationToken)
+    private async Task<EngineSelection> SelectEngineAsync(
+        ArchiveCandidate candidate,
+        string archivePath,
+        IReadOnlyList<string>? passwords,
+        CancellationToken cancellationToken)
     {
-        var validation = await _engine.TestAsync(archivePath, cancellationToken).ConfigureAwait(false);
-        if (validation.Succeeded) return null;
-
-        if (_engine is not IPasswordArchiveEngine passwordEngine)
+        var passwordRequired = false;
+        var attemptedPasswords = 0;
+        foreach (var engine in OrderEngines(candidate.RecognitionEngineKind))
         {
-            throw new InvalidDataException($"{_engine.Descriptor.DisplayName} could not validate the archive.");
+            cancellationToken.ThrowIfCancellationRequested();
+            ArchiveRecognitionResult recognition;
+            try
+            {
+                recognition = await engine.RecognizeAsync(archivePath, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
+            {
+                continue;
+            }
+            if (!recognition.CanExtract) continue;
+
+            ArchiveRecognitionResult validation;
+            try
+            {
+                validation = await engine.ValidateAsync(archivePath, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
+            {
+                continue;
+            }
+            if (validation.Status == ArchiveRecognitionStatus.Recognized) return new EngineSelection(engine, null);
+            if (validation.Status != ArchiveRecognitionStatus.PasswordRequired || engine is not IPasswordArchiveEngine passwordEngine) continue;
+
+            passwordRequired = true;
+            foreach (var password in passwords ?? [])
+            {
+                if (string.IsNullOrEmpty(password)) continue;
+                attemptedPasswords++;
+                var result = await passwordEngine.TestWithPasswordAsync(archivePath, password, cancellationToken).ConfigureAwait(false);
+                if (result.Succeeded) return new EngineSelection(engine, password);
+            }
         }
 
-        var attempted = 0;
-        foreach (var password in passwords ?? [])
+        if (passwordRequired)
         {
-            if (string.IsNullOrEmpty(password)) continue;
-            attempted++;
-            if ((await passwordEngine.TestWithPasswordAsync(archivePath, password, cancellationToken).ConfigureAwait(false)).Succeeded) return password;
+            throw new ArchivePasswordRequiredException(candidate.Path, attemptedPasswords);
         }
 
-        throw new ArchivePasswordRequiredException(archivePath, attempted);
+        throw new InvalidDataException("No installed archive engine could validate the selected archive.");
     }
+
+    private IEnumerable<IArchiveEngine> OrderEngines(ArchiveEngineKind? recognitionEngineKind) =>
+        recognitionEngineKind is null
+            ? _engines
+            : _engines.OrderBy(engine => engine.Descriptor.Kind == recognitionEngineKind ? 0 : 1);
 
     private static async Task<string> PrepareEngineArchivePathAsync(
         ArchiveCandidate candidate,
@@ -158,7 +202,7 @@ public sealed partial class ArchiveExtractionService
 
             var embeddedDirectory = Path.Combine(workingDirectory, "embedded-archive");
             Directory.CreateDirectory(embeddedDirectory);
-            var embeddedPath = Path.Combine(embeddedDirectory, candidate.Format == ArchiveFormat.Zip ? "payload.zip" : "payload.bin");
+            var embeddedPath = Path.Combine(embeddedDirectory, GetEmbeddedArchiveName(candidate.Format));
             await using var source = new FileStream(
                 candidate.Path,
                 FileMode.Open,
@@ -221,6 +265,22 @@ public sealed partial class ArchiveExtractionService
     [DllImport("kernel32.dll", EntryPoint = "CreateHardLinkW", SetLastError = true, CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CreateHardLinkNative(string fileName, string existingFileName, IntPtr securityAttributes);
+
+    private static string GetEmbeddedArchiveName(ArchiveFormat format) => format switch
+    {
+        ArchiveFormat.SevenZip => "payload.7z",
+        ArchiveFormat.Rar or ArchiveFormat.Rar5 => "payload.rar",
+        ArchiveFormat.Zip => "payload.zip",
+        ArchiveFormat.Tar => "payload.tar",
+        ArchiveFormat.GZip => "payload.gz",
+        ArchiveFormat.BZip2 => "payload.bz2",
+        ArchiveFormat.Xz => "payload.xz",
+        ArchiveFormat.Zstandard => "payload.zst",
+        ArchiveFormat.Cab => "payload.cab",
+        ArchiveFormat.Arj => "payload.arj",
+        ArchiveFormat.Lzh => "payload.lzh",
+        _ => "payload.bin",
+    };
 
     private static void NormalizeOutputTree(string directory, CancellationToken cancellationToken)
     {
@@ -291,4 +351,6 @@ public sealed partial class ArchiveExtractionService
 
         return candidate;
     }
+
+    private sealed record EngineSelection(IArchiveEngine Engine, string? Password);
 }
