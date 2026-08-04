@@ -19,3 +19,12 @@
 - Commit the implementation and completion record, then push main.
 - Preserve the unrelated user-owned untracked plan file.
 
+## Verification Results
+
+- Release tests passed: 75 passed, 0 failed; Release build completed with 0 warnings and 0 errors.
+- The installer compiled successfully with the new Start Menu icon entry and overwrote the existing installation.
+- Installed version: `1.0.3+4b6601af2db6cdc17da519465007421b220ba875`.
+- Start Menu shortcut target is `C:\Program Files\EasyUnpack\EasyUnpack.App.exe`, with the expected working directory and no arguments.
+- The installed no-argument application opened `EasyUnpack - 引擎设置`; file and directory shell registrations remained valid.
+- The WPF regression covered masked, revealed, re-masked, selected-entry, and reopened-window states without persisting or logging the test password.
+- The isolated UI directory and installer log created by this work were removed. The unrelated user-owned untracked plan file was not modified or committed.
