@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using EasyUnpack.Core.Archives;
 using EasyUnpack.Core.Configuration;
 using EasyUnpack.Core.Engines;
@@ -101,11 +102,13 @@ public partial class MainWindow : Window
         foreach (var task in candidates)
         {
             var candidate = task.Candidate;
+            var progress = new Progress<ExtractionProgress>(task.UpdateProgress);
             try
             {
                 task.Status = "正在解压";
+                task.ResetProgress();
                 SetStatus($"正在解压：{candidate.LogicalName}", StatusTone.Info);
-                var result = await service.ExtractAsync(candidate, vault.GetCandidates());
+                var result = await service.ExtractAsync(candidate, vault.GetCandidates(), progress: progress);
                 ApplySuccess(task, result, ref warnings);
                 succeeded++;
             }
@@ -115,13 +118,16 @@ public partial class MainWindow : Window
                 if (dialog.ShowDialog() != true || dialog.Password is null)
                 {
                     task.Status = "需要密码";
+                    task.ClearProgress();
                     failed++;
                     continue;
                 }
 
                 try
                 {
-                    var result = await service.ExtractAsync(candidate, vault.GetCandidates().Append(dialog.Password).ToArray());
+                    task.Status = "正在解压";
+                    task.ResetProgress();
+                    var result = await service.ExtractAsync(candidate, vault.GetCandidates().Append(dialog.Password).ToArray(), progress: progress);
                     vault.RecordSuccessfulPassword(dialog.Password);
                     if (maySavePasswords) await PasswordVaultStore.SaveAsync(vault, ApplicationStorage.PasswordVaultPath, masterPassword);
                     ApplySuccess(task, result, ref warnings);
@@ -130,6 +136,7 @@ public partial class MainWindow : Window
                 catch (ArchivePasswordRequiredException)
                 {
                     task.Status = "密码不正确";
+                    task.ClearProgress();
                     failed++;
                 }
                 catch (Exception)
@@ -141,6 +148,7 @@ public partial class MainWindow : Window
             catch (Exception)
             {
                 task.Status = "解压失败，源文件已保留";
+                task.ClearProgress();
                 failed++;
             }
         }
@@ -162,6 +170,7 @@ public partial class MainWindow : Window
     private static void ApplySuccess(CandidateTaskItem task, ExtractionResult result, ref int warnings)
     {
         task.OutputDirectory = result.OutputDirectory;
+        task.ClearProgress();
         if (result.SourceRecycled)
         {
             task.Status = "已完成";
@@ -186,6 +195,32 @@ public partial class MainWindow : Window
         StatusPanel.BorderBrush = brush;
         StatusIcon.Foreground = brush;
         StatusIcon.Text = icon;
+        StatusIcon.Visibility = Visibility.Visible;
+        ActivityProgress.Visibility = tone == StatusTone.Info ? Visibility.Visible : Visibility.Collapsed;
+        if (tone == StatusTone.Info)
+        {
+            StartStatusAnimation();
+        }
+        else
+        {
+            StopStatusAnimation();
+        }
+    }
+
+    private void StartStatusAnimation()
+    {
+        if (StatusIcon.RenderTransform is not RotateTransform rotation) return;
+        rotation.BeginAnimation(RotateTransform.AngleProperty, new DoubleAnimation(0, 360, TimeSpan.FromSeconds(1.1))
+        {
+            RepeatBehavior = RepeatBehavior.Forever
+        });
+    }
+
+    private void StopStatusAnimation()
+    {
+        if (StatusIcon.RenderTransform is not RotateTransform rotation) return;
+        rotation.BeginAnimation(RotateTransform.AngleProperty, null);
+        rotation.Angle = 0;
     }
 
     private enum StatusTone
@@ -200,6 +235,9 @@ public partial class MainWindow : Window
     {
         private string _status = "等待处理";
         private string? _outputDirectory;
+        private double _progressPercent;
+        private bool _isProgressIndeterminate;
+        private string _progressText = "等待";
 
         public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -219,6 +257,55 @@ public partial class MainWindow : Window
             get => _status;
             set => SetField(ref _status, value);
         }
+
+        public double ProgressPercent
+        {
+            get => _progressPercent;
+            private set => SetField(ref _progressPercent, value);
+        }
+
+        public bool IsProgressIndeterminate
+        {
+            get => _isProgressIndeterminate;
+            private set => SetField(ref _isProgressIndeterminate, value);
+        }
+
+        public string ProgressText
+        {
+            get => _progressText;
+            private set => SetField(ref _progressText, value);
+        }
+
+        public void ResetProgress()
+        {
+            ProgressPercent = 0;
+            IsProgressIndeterminate = true;
+            ProgressText = "正在启动引擎…";
+        }
+
+        public void UpdateProgress(ExtractionProgress progress)
+        {
+            IsProgressIndeterminate = true;
+            ProgressText = $"已写入 {progress.FileCount:N0} 个文件 · {FormatBytes(progress.BytesWritten)} · {FormatElapsed(progress.Elapsed)}";
+        }
+
+        public void ClearProgress()
+        {
+            IsProgressIndeterminate = false;
+            ProgressPercent = 0;
+        }
+
+        private static string FormatBytes(long bytes) => bytes switch
+        {
+            >= 1024L * 1024 * 1024 => $"{bytes / (1024d * 1024 * 1024):0.0} GB",
+            >= 1024L * 1024 => $"{bytes / (1024d * 1024):0.0} MB",
+            >= 1024L => $"{bytes / 1024d:0} KB",
+            _ => $"{bytes:N0} B",
+        };
+
+        private static string FormatElapsed(TimeSpan elapsed) => elapsed.TotalHours >= 1
+            ? elapsed.ToString(@"h\:mm\:ss")
+            : elapsed.ToString(@"m\:ss");
 
         private void SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
         {

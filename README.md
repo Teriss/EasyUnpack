@@ -110,6 +110,8 @@ The installer creates an EasyUnpack shortcut in the Start Menu. Launching it wit
 
 The application uses the bundled EasyUnpack icon at all standard Windows sizes. The same icon is returned by the Explorer command, while the shell extension continues to receive paths only and never inspects archive contents.
 
+During extraction, each task reports the number of files and bytes already written plus elapsed time. The activity bar remains animated while the archive engine is running; because archive engines do not always expose a reliable total, the UI deliberately reports observed work instead of inventing a percentage.
+
 Password entries remain masked by default. The vault window can temporarily reveal the whole list in memory, and closing the window restores masking. The vault file format and master-password protection are unchanged; plaintext passwords are not written to logs, screenshots, clipboard contents, or task history.
 
 ## 许可证

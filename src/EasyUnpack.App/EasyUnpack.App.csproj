@@ -18,7 +18,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Content Include="Assets\EasyUnpack.ico" />
+    <Resource Include="Assets\EasyUnpack.ico" />
   </ItemGroup>
 
 </Project>

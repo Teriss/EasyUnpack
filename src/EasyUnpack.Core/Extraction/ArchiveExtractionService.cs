@@ -1,5 +1,6 @@
 using EasyUnpack.Core.Archives;
 using EasyUnpack.Core.Engines;
+using System.Diagnostics;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 
@@ -26,7 +27,11 @@ public sealed partial class ArchiveExtractionService
 
     public int MaximumNestedDepth { get; init; } = 10;
 
-    public async Task<ExtractionResult> ExtractAsync(ArchiveCandidate candidate, IReadOnlyList<string>? passwords = null, CancellationToken cancellationToken = default)
+    public async Task<ExtractionResult> ExtractAsync(
+        ArchiveCandidate candidate,
+        IReadOnlyList<string>? passwords = null,
+        CancellationToken cancellationToken = default,
+        IProgress<ExtractionProgress>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(candidate);
         var sourceDirectory = Path.GetDirectoryName(candidate.Path) ?? throw new InvalidOperationException("Archive source directory is unavailable.");
@@ -42,12 +47,16 @@ public sealed partial class ArchiveExtractionService
             Directory.CreateDirectory(extractionDirectory);
             var engineArchivePath = await PrepareEngineArchivePathAsync(candidate, volumes, workingDirectory, cancellationToken).ConfigureAwait(false);
             var selection = await SelectEngineAsync(candidate, engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
-            var extraction = selection.Password is null
-                ? await selection.Engine.ExtractAsync(engineArchivePath, extractionDirectory, cancellationToken).ConfigureAwait(false)
-                : await ((IPasswordArchiveEngine)selection.Engine).ExtractWithPasswordAsync(engineArchivePath, extractionDirectory, selection.Password, cancellationToken).ConfigureAwait(false);
+            var extraction = await RunExtractionWithProgressAsync(
+                extractionDirectory,
+                progress,
+                selection.Password is null
+                    ? selection.Engine.ExtractAsync(engineArchivePath, extractionDirectory, cancellationToken)
+                    : ((IPasswordArchiveEngine)selection.Engine).ExtractWithPasswordAsync(engineArchivePath, extractionDirectory, selection.Password, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
             if (!extraction.Succeeded) throw new InvalidDataException($"{selection.Engine.Descriptor.DisplayName} could not extract the archive.");
 
-            await ProcessNestedArchivesAsync(extractionDirectory, workingDirectory, consumedDirectory, passwords, cancellationToken).ConfigureAwait(false);
+            await ProcessNestedArchivesAsync(extractionDirectory, workingDirectory, consumedDirectory, passwords, progress, cancellationToken).ConfigureAwait(false);
             NormalizeOutputTree(extractionDirectory, cancellationToken);
             var targetDirectory = ReserveTargetDirectory(sourceDirectory, candidate.LogicalName);
             Directory.Move(extractionDirectory, targetDirectory);
@@ -72,7 +81,82 @@ public sealed partial class ArchiveExtractionService
         }
     }
 
-    private async Task ProcessNestedArchivesAsync(string rootDirectory, string workingDirectory, string consumedDirectory, IReadOnlyList<string>? passwords, CancellationToken cancellationToken)
+    private static async Task<EngineExecutionResult> RunExtractionWithProgressAsync(
+        string extractionDirectory,
+        IProgress<ExtractionProgress>? progress,
+        Task<EngineExecutionResult> extractionTask,
+        CancellationToken cancellationToken)
+    {
+        if (progress is null) return await extractionTask.ConfigureAwait(false);
+
+        using var monitorCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var started = Stopwatch.GetTimestamp();
+        var monitorTask = MonitorExtractionDirectoryAsync(extractionDirectory, progress, started, monitorCancellation.Token);
+        try
+        {
+            return await extractionTask.ConfigureAwait(false);
+        }
+        finally
+        {
+            monitorCancellation.Cancel();
+            await monitorTask.ConfigureAwait(false);
+            ReportExtractionProgress(extractionDirectory, progress, started);
+        }
+    }
+
+    private static async Task MonitorExtractionDirectoryAsync(
+        string extractionDirectory,
+        IProgress<ExtractionProgress> progress,
+        long started,
+        CancellationToken cancellationToken)
+    {
+        ReportExtractionProgress(extractionDirectory, progress, started);
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            ReportExtractionProgress(extractionDirectory, progress, started);
+        }
+    }
+
+    private static void ReportExtractionProgress(string extractionDirectory, IProgress<ExtractionProgress> progress, long started)
+    {
+        var fileCount = 0;
+        long bytes = 0;
+        try
+        {
+            if (Directory.Exists(extractionDirectory))
+            {
+                foreach (var path in Directory.EnumerateFiles(extractionDirectory, "*", SearchOption.AllDirectories))
+                {
+                    try
+                    {
+                        bytes += new FileInfo(path).Length;
+                        fileCount++;
+                    }
+                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                    {
+                        // A file may still be moving or being written by the engine.
+                    }
+                }
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // The directory can briefly be unavailable while an engine creates it.
+        }
+
+        progress.Report(new ExtractionProgress(fileCount, bytes, Stopwatch.GetElapsedTime(started)));
+    }
+
+    private async Task ProcessNestedArchivesAsync(string rootDirectory, string workingDirectory, string consumedDirectory, IReadOnlyList<string>? passwords, IProgress<ExtractionProgress>? progress, CancellationToken cancellationToken)
     {
         var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         for (var depth = 0; ; depth++)
@@ -86,12 +170,12 @@ public sealed partial class ArchiveExtractionService
             foreach (var nested in candidates)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                await ExtractNestedArchiveAsync(nested, workingDirectory, consumedDirectory, passwords, cancellationToken).ConfigureAwait(false);
+                await ExtractNestedArchiveAsync(nested, workingDirectory, consumedDirectory, passwords, progress, cancellationToken).ConfigureAwait(false);
             }
         }
     }
 
-    private async Task ExtractNestedArchiveAsync(ArchiveCandidate candidate, string workingDirectory, string consumedDirectory, IReadOnlyList<string>? passwords, CancellationToken cancellationToken)
+    private async Task ExtractNestedArchiveAsync(ArchiveCandidate candidate, string workingDirectory, string consumedDirectory, IReadOnlyList<string>? passwords, IProgress<ExtractionProgress>? progress, CancellationToken cancellationToken)
     {
         var nestedWorkingDirectory = Path.Combine(workingDirectory, $"nested-{Guid.NewGuid():N}");
         var nestedContentsDirectory = Path.Combine(nestedWorkingDirectory, "contents");
@@ -102,9 +186,13 @@ public sealed partial class ArchiveExtractionService
             Directory.CreateDirectory(nestedContentsDirectory);
             var engineArchivePath = await PrepareEngineArchivePathAsync(candidate, volumes, nestedWorkingDirectory, cancellationToken).ConfigureAwait(false);
             var selection = await SelectEngineAsync(candidate, engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
-            var extraction = selection.Password is null
-                ? await selection.Engine.ExtractAsync(engineArchivePath, nestedContentsDirectory, cancellationToken).ConfigureAwait(false)
-                : await ((IPasswordArchiveEngine)selection.Engine).ExtractWithPasswordAsync(engineArchivePath, nestedContentsDirectory, selection.Password, cancellationToken).ConfigureAwait(false);
+            var extraction = await RunExtractionWithProgressAsync(
+                nestedContentsDirectory,
+                progress,
+                selection.Password is null
+                    ? selection.Engine.ExtractAsync(engineArchivePath, nestedContentsDirectory, cancellationToken)
+                    : ((IPasswordArchiveEngine)selection.Engine).ExtractWithPasswordAsync(engineArchivePath, nestedContentsDirectory, selection.Password, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
             if (!extraction.Succeeded) throw new InvalidDataException($"{selection.Engine.Descriptor.DisplayName} could not extract nested archive {candidate.Path}.");
 
             NormalizeOutputTree(nestedContentsDirectory, cancellationToken);

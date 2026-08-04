@@ -5,6 +5,10 @@
     <SolidColorBrush x:Key="ErrorBrush" Color="#C42B1C" />
     <SolidColorBrush x:Key="InfoBrush" Color="#3377D6" />
 
+    <Style TargetType="Window">
+        <Setter Property="Icon" Value="/EasyUnpack.App;component/Assets/EasyUnpack.ico" />
+    </Style>
+
     <Style x:Key="PageTitleTextStyle" TargetType="TextBlock">
         <Setter Property="FontSize" Value="24" />
         <Setter Property="FontWeight" Value="SemiBold" />

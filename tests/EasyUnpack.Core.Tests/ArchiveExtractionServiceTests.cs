@@ -1,6 +1,7 @@
 using EasyUnpack.Core.Archives;
 using EasyUnpack.Core.Engines;
 using EasyUnpack.Core.Extraction;
+using System.Collections.Concurrent;
 
 namespace EasyUnpack.Core.Tests;
 
@@ -9,6 +10,26 @@ public sealed class ArchiveExtractionServiceTests : IDisposable
     private readonly string _directory = Path.Combine(Path.GetTempPath(), $"EasyUnpackExtractionTests-{Guid.NewGuid():N}");
 
     public ArchiveExtractionServiceTests() => Directory.CreateDirectory(_directory);
+
+    [Fact]
+    public async Task Extract_reports_written_file_count_and_bytes_while_engine_is_running()
+    {
+        var archivePath = Path.Combine(_directory, "progress.rar");
+        await File.WriteAllBytesAsync(archivePath, Convert.FromHexString("526172211A0700"));
+        var reports = new List<ExtractionProgress>();
+        var engine = new FakeEngine(async (destination, cancellationToken) =>
+        {
+            await File.WriteAllTextAsync(Path.Combine(destination, "progress.txt"), "visible progress", cancellationToken);
+            await Task.Delay(700, cancellationToken);
+        });
+
+        await new ArchiveExtractionService(engine, new RecordingRecycler()).ExtractAsync(
+            new ArchiveCandidate(archivePath, ArchiveFormat.Rar, true),
+            progress: new InlineProgress<ExtractionProgress>(reports.Add));
+
+        Assert.Contains(reports, report => report.FileCount >= 1 && report.BytesWritten > 0);
+        Assert.All(reports, report => Assert.True(report.Elapsed >= TimeSpan.Zero));
+    }
 
     [Fact]
     public async Task Extract_publishes_a_generic_wrapper_under_the_archive_name_then_recycles_source()
@@ -54,6 +75,27 @@ public sealed class ArchiveExtractionServiceTests : IDisposable
         Assert.True(Directory.Exists(result.OutputDirectory));
         Assert.True(File.Exists(archivePath));
         Assert.NotNull(result.Warning);
+    }
+
+    [Fact]
+    public async Task Extract_reports_output_activity_while_engine_is_running()
+    {
+        var archivePath = Path.Combine(_directory, "progress.rar");
+        await File.WriteAllBytesAsync(archivePath, Convert.FromHexString("526172211A0700"));
+        var engine = new FakeEngine(async (destination, cancellationToken) =>
+        {
+            await Task.Delay(700, cancellationToken);
+            await File.WriteAllTextAsync(Path.Combine(destination, "file.txt"), "content", cancellationToken);
+        });
+        var reports = new ConcurrentQueue<ExtractionProgress>();
+        var progress = new Progress<ExtractionProgress>(reports.Enqueue);
+
+        await new ArchiveExtractionService(engine, new RecordingRecycler()).ExtractAsync(
+            new ArchiveCandidate(archivePath, ArchiveFormat.Rar, true), progress: progress);
+
+        Assert.NotEmpty(reports);
+        Assert.Contains(reports, report => report.FileCount >= 1 && report.BytesWritten > 0);
+        Assert.Contains(reports, report => report.Elapsed >= TimeSpan.Zero);
     }
 
     [Fact]
@@ -233,6 +275,11 @@ public sealed class ArchiveExtractionServiceTests : IDisposable
         }
 
         private static EngineExecutionResult Success() => new(true, 0, string.Empty, string.Empty);
+    }
+
+    private sealed class InlineProgress<T>(Action<T> callback) : IProgress<T>
+    {
+        public void Report(T value) => callback(value);
     }
 
     private sealed class PathRecordingEngine : IArchiveEngine
