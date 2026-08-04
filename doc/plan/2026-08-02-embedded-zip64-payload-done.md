@@ -35,3 +35,10 @@ Large ZIP payloads appended to media files use ZIP64 metadata when a central-dir
 - `dotnet test EasyUnpack.slnx --configuration Release`: 64 passed, 0 failed.
 - `dotnet build EasyUnpack.slnx --configuration Release`: 0 warnings, 0 errors.
 - Test-created temporary directories and the one-time real-file probe runner are absent.
+
+## Final Verification
+
+- The hybrid recognition implementation and later settings/password-vault fixes were committed and pushed on `main`.
+- Release tests passed with 75 tests and the Release build completed with 0 warnings and 0 errors.
+- The original sample remained unchanged during read-only probing and still reports ZIP offset `915459573` and length `5115624562`.
+- The existing `v1.0.3` tag and Release were previously published and are now scheduled to be replaced with the latest main commit and installer at the user's request.
