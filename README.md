@@ -108,6 +108,8 @@ EasyUnpack 1.0.3 已完成核心自动解压、密码库、嵌套处理、媒体
 
 The installer creates an EasyUnpack shortcut in the Start Menu. Launching it without a selected archive opens engine settings; the password vault is available from that settings window.
 
+The application uses the bundled EasyUnpack icon at all standard Windows sizes. The same icon is returned by the Explorer command, while the shell extension continues to receive paths only and never inspects archive contents.
+
 Password entries remain masked by default. The vault window can temporarily reveal the whole list in memory, and closing the window restores masking. The vault file format and master-password protection are unchanged; plaintext passwords are not written to logs, screenshots, clipboard contents, or task history.
 
 ## 许可证

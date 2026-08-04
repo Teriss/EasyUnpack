@@ -14,6 +14,11 @@
     <AssemblyVersion>1.0.3.0</AssemblyVersion>
     <FileVersion>1.0.3.0</FileVersion>
     <InformationalVersion>1.0.3</InformationalVersion>
+    <ApplicationIcon>Assets\EasyUnpack.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\EasyUnpack.ico" />
+  </ItemGroup>
 
 </Project>

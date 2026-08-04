@@ -41,6 +41,9 @@ Verified on 2026-07-27:
 - The installed app extracted a disguised `.mp4` archive successfully, and both Explorer registry commands resolve to `使用 EasyUnpack 自动解压`.
 - `App.xaml` retains `ThemeMode="System"`; the current host is in light mode. A visual dark-mode pass was not forced because that would modify the user's Windows theme setting.
 
-External blocker:
+Verified on 2026-08-04:
 
-- The required `imagegen` backend is unavailable in this session. There is no built-in image-generation call, local imagegen script, or configured API key, so the 1024px source image, transparent PNG, multi-size ICO, icon wiring, and icon-size/background visual checks remain incomplete. The plan must not be renamed to `-done.md` until those assets and checks are finished.
+- Generated `src/EasyUnpack.App/Assets/EasyUnpack-1024.png` with transparent corners and a high-contrast archive/checkmark mark; visual inspection confirmed centered geometry and clean edges.
+- Generated `src/EasyUnpack.App/Assets/EasyUnpack.ico` with 16, 24, 32, 48, 64, 128, and 256 pixel PNG frames.
+- Wired the ICO into the WPF application and returned the installed application icon from `IExplorerCommand::GetIcon`.
+- Updated README and password-vault/shell-extension architecture notes with the settings entry, reveal boundary, and icon behavior.

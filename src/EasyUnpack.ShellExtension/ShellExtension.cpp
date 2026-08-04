@@ -123,7 +123,14 @@ class __declspec(uuid("A7B99305-3DA8-4EAB-965E-72070CDBA1A8")) EasyUnpackCommand
 {
 public:
     IFACEMETHODIMP GetTitle(IShellItemArray*, PWSTR* title) override { return SHStrDupW(kCommandTitle, title); }
-    IFACEMETHODIMP GetIcon(IShellItemArray*, PWSTR* icon) override { *icon = nullptr; return E_NOTIMPL; }
+    IFACEMETHODIMP GetIcon(IShellItemArray*, PWSTR* icon) override
+    {
+        if (icon == nullptr) return E_INVALIDARG;
+        const auto moduleDirectory = GetModuleDirectory();
+        if (moduleDirectory.empty()) return E_FAIL;
+        const auto iconPath = moduleDirectory + L"\\EasyUnpack.App.exe,0";
+        return SHStrDupW(iconPath.c_str(), icon);
+    }
     IFACEMETHODIMP GetToolTip(IShellItemArray*, PWSTR* toolTip) override { *toolTip = nullptr; return E_NOTIMPL; }
     IFACEMETHODIMP GetCanonicalName(GUID* canonicalName) override { return CLSIDFromString(kCommandClsid, canonicalName); }
     IFACEMETHODIMP GetFlags(EXPCMDFLAGS* flags) override { *flags = ECF_DEFAULT; return S_OK; }
