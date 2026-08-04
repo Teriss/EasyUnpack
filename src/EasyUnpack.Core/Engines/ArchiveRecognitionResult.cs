@@ -10,7 +10,11 @@ public enum ArchiveRecognitionStatus
     UnsupportedOrCorrupt,
 }
 
-public sealed record ArchiveRecognitionResult(ArchiveRecognitionStatus Status, ArchiveFormat Format = ArchiveFormat.Unknown)
+public sealed record ArchiveRecognitionResult(
+    ArchiveRecognitionStatus Status,
+    ArchiveFormat Format = ArchiveFormat.Unknown,
+    long? TotalUncompressedBytes = null,
+    int? EntryCount = null)
 {
     public bool CanExtract => Status is ArchiveRecognitionStatus.Recognized or ArchiveRecognitionStatus.PasswordRequired;
 

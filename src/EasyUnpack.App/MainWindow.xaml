@@ -6,7 +6,7 @@
         FontFamily="Segoe UI Variable Text, Microsoft YaHei UI"
         Background="{DynamicResource {x:Static SystemColors.WindowBrushKey}}"
         Foreground="{DynamicResource {x:Static SystemColors.ControlTextBrushKey}}"
-        Loaded="Window_Loaded">
+        Loaded="Window_Loaded" Closing="Window_Closing">
     <Grid Margin="24">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -51,6 +51,13 @@
         <Border x:Name="StatusPanel" Grid.Row="1" Margin="0,20,0,12" Padding="12,10"
                 Style="{StaticResource SurfaceBorderStyle}" BorderThickness="4,1,1,1" BorderBrush="{StaticResource InfoBrush}">
             <DockPanel LastChildFill="True">
+                <Button x:Name="CancelCurrentTaskButton" DockPanel.Dock="Right" Style="{StaticResource ActionButtonStyle}"
+                        Click="CancelCurrentTask_Click" IsEnabled="False" Margin="12,0,0,0" ToolTip="停止当前解压并保留已写入文件">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="&#xE711;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Margin="0,0,6,0" />
+                        <TextBlock Text="取消当前任务" />
+                    </StackPanel>
+                </Button>
                 <ProgressBar x:Name="ActivityProgress" Width="72" Height="8" Margin="0,0,10,0"
                              IsIndeterminate="True" VerticalAlignment="Center" Visibility="Visible" />
                 <TextBlock x:Name="StatusIcon" Text="&#xE895;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets"
@@ -98,9 +105,9 @@
                             <DataTemplate>
                                 <StackPanel Margin="0,4">
                                     <ProgressBar Height="6" Minimum="0" Maximum="100"
-                                                 Value="{Binding ProgressPercent}"
-                                                 IsIndeterminate="{Binding IsProgressIndeterminate}" />
-                                    <TextBlock Text="{Binding ProgressText}" Style="{StaticResource PathCellTextStyle}" />
+                                                 Value="{Binding ProgressPercent, Mode=OneWay}"
+                                                 IsIndeterminate="{Binding IsProgressIndeterminate, Mode=OneWay}" />
+                                    <TextBlock Text="{Binding ProgressText, Mode=OneWay}" Style="{StaticResource PathCellTextStyle}" />
                                 </StackPanel>
                             </DataTemplate>
                         </DataGridTemplateColumn.CellTemplate>

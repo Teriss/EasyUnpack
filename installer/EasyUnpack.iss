@@ -20,11 +20,13 @@ PrivilegesRequired=admin
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-UninstallDisplayIcon={app}\{#AppExeName}
+UninstallDisplayIcon={app}\EasyUnpack.ico
+ChangesAssociations=yes
 
 [Files]
 Source: "..\artifacts\publish\app\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 Source: "..\artifacts\publish\shell\EasyUnpack.ShellExtension.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\src\EasyUnpack.App\Assets\EasyUnpack.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\EasyUnpack"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"

@@ -128,7 +128,7 @@ public:
         if (icon == nullptr) return E_INVALIDARG;
         const auto moduleDirectory = GetModuleDirectory();
         if (moduleDirectory.empty()) return E_FAIL;
-        const auto iconPath = moduleDirectory + L"\\EasyUnpack.App.exe,0";
+        const auto iconPath = moduleDirectory + L"\\EasyUnpack.ico";
         return SHStrDupW(iconPath.c_str(), icon);
     }
     IFACEMETHODIMP GetToolTip(IShellItemArray*, PWSTR* toolTip) override { *toolTip = nullptr; return E_NOTIMPL; }

@@ -1,5 +1,8 @@
 namespace EasyUnpack.Core.Engines;
 
+using System.Globalization;
+using System.Text.RegularExpressions;
+
 /// <summary>Bandizip's documented bz.exe command-line adapter.</summary>
 public sealed class BandizipEngine : IPasswordArchiveEngine
 {
@@ -51,11 +54,27 @@ public sealed class BandizipEngine : IPasswordArchiveEngine
         try
         {
             var result = await RunAsync(arguments, linked.Token).ConfigureAwait(false);
-            return ArchiveEngineResultClassifier.Classify(result, validation: false);
+            var recognition = ArchiveEngineResultClassifier.Classify(result, validation: false);
+            var total = TryParseListedUncompressedBytes(result.StandardOutput);
+            return recognition with { TotalUncompressedBytes = total };
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             return new ArchiveRecognitionResult(ArchiveRecognitionStatus.UnsupportedOrCorrupt);
         }
+    }
+
+    internal static long? TryParseListedUncompressedBytes(string output)
+    {
+        // bz.exe's table starts each file line with the uncompressed Size column.
+        long total = 0;
+        var entries = 0;
+        foreach (var line in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var match = Regex.Match(line, @"^(?<size>[0-9][0-9,]*)\s+[0-9][0-9,]*\s+");
+            if (!match.Success || !long.TryParse(match.Groups["size"].Value.Replace(",", string.Empty), NumberStyles.None, CultureInfo.InvariantCulture, out var size)) continue;
+            try { total = checked(total + size); entries++; } catch (OverflowException) { return null; }
+        }
+        return entries == 0 ? null : total;
     }
 }

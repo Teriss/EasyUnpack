@@ -1,8 +1,8 @@
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using EasyUnpack.Core.Archives;
 using EasyUnpack.Core.Engines;
-using System.Diagnostics;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
 
 namespace EasyUnpack.Core.Extraction;
 
@@ -11,10 +11,7 @@ public sealed partial class ArchiveExtractionService
     private readonly IReadOnlyList<IArchiveEngine> _engines;
     private readonly IArchiveSourceRecycler _recycler;
 
-    public ArchiveExtractionService(IArchiveEngine engine, IArchiveSourceRecycler recycler)
-        : this([engine], recycler)
-    {
-    }
+    public ArchiveExtractionService(IArchiveEngine engine, IArchiveSourceRecycler recycler) : this([engine], recycler) { }
 
     public ArchiveExtractionService(IReadOnlyList<IArchiveEngine> engines, IArchiveSourceRecycler recycler)
     {
@@ -31,41 +28,48 @@ public sealed partial class ArchiveExtractionService
         ArchiveCandidate candidate,
         IReadOnlyList<string>? passwords = null,
         CancellationToken cancellationToken = default,
-        IProgress<ExtractionProgress>? progress = null)
+        IProgress<ExtractionProgress>? progress = null,
+        IProgress<ArchiveOperationUpdate>? operationProgress = null,
+        Func<ArchivePasswordRequest, CancellationToken, Task<string?>>? passwordProvider = null,
+        Action<string>? passwordAccepted = null)
     {
         ArgumentNullException.ThrowIfNull(candidate);
         var sourceDirectory = Path.GetDirectoryName(candidate.Path) ?? throw new InvalidOperationException("Archive source directory is unavailable.");
+        var rootArchive = new ArchiveContext(candidate, Guid.NewGuid(), null);
+        var operations = new OperationReporter(operationProgress, rootArchive);
         var volumes = ArchiveVolumeResolver.Resolve(candidate);
         if (!volumes.IsComplete) throw new InvalidDataException(volumes.IncompleteReason);
-        var workingDirectory = Path.Combine(sourceDirectory, $".easyunpack-{Guid.NewGuid():N}");
-        var consumedDirectory = Path.Combine(sourceDirectory, $".easyunpack-consumed-{Guid.NewGuid():N}");
-        var extractionDirectory = Path.Combine(workingDirectory, "contents");
-        var published = false;
 
+        var workingDirectory = Path.Combine(sourceDirectory, $".easyunpack-{Guid.NewGuid():N}");
+        var consumedDirectory = Path.Combine(workingDirectory, "consumed");
+        var contentsDirectory = Path.Combine(workingDirectory, "contents");
+        var published = false;
+        var canceled = false;
         try
         {
-            Directory.CreateDirectory(extractionDirectory);
-            var engineArchivePath = await PrepareEngineArchivePathAsync(candidate, volumes, workingDirectory, cancellationToken).ConfigureAwait(false);
-            var selection = await SelectEngineAsync(candidate, engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
-            var extraction = await RunExtractionWithProgressAsync(
-                extractionDirectory,
-                progress,
-                selection.Password is null
-                    ? selection.Engine.ExtractAsync(engineArchivePath, extractionDirectory, cancellationToken)
-                    : ((IPasswordArchiveEngine)selection.Engine).ExtractWithPasswordAsync(engineArchivePath, extractionDirectory, selection.Password, cancellationToken),
-                cancellationToken).ConfigureAwait(false);
-            if (!extraction.Succeeded) throw new InvalidDataException($"{selection.Engine.Descriptor.DisplayName} could not extract the archive.");
+            Directory.CreateDirectory(contentsDirectory);
+            await ExtractArchiveAsync(rootArchive, volumes, workingDirectory, contentsDirectory, passwords, progress, operations, passwordProvider, passwordAccepted, cancellationToken).ConfigureAwait(false);
+            await ProcessNestedArchivesAsync(contentsDirectory, workingDirectory, consumedDirectory, rootArchive, passwords, progress, operations, passwordProvider, passwordAccepted, cancellationToken).ConfigureAwait(false);
 
-            await ProcessNestedArchivesAsync(extractionDirectory, workingDirectory, consumedDirectory, passwords, progress, cancellationToken).ConfigureAwait(false);
-            NormalizeOutputTree(extractionDirectory, cancellationToken);
-            var targetDirectory = ReserveTargetDirectory(sourceDirectory, candidate.LogicalName);
-            Directory.Move(extractionDirectory, targetDirectory);
+            await RunSynchronousOperationAsync(operations, ArchiveOperationKind.Normalize, null, cancellationToken, () => NormalizeOutputTree(contentsDirectory, cancellationToken)).ConfigureAwait(false);
+            string targetDirectory = string.Empty;
+            await RunSynchronousOperationAsync(operations, ArchiveOperationKind.Publish, null, cancellationToken, () =>
+            {
+                targetDirectory = ReserveTargetDirectory(sourceDirectory, candidate.LogicalName);
+                Directory.Move(contentsDirectory, targetDirectory);
+            }).ConfigureAwait(false);
             published = true;
+            var recycleConsumedDirectory = consumedDirectory;
+            if (Directory.Exists(consumedDirectory))
+            {
+                recycleConsumedDirectory = Path.Combine(sourceDirectory, $".easyunpack-consumed-{Guid.NewGuid():N}");
+                Directory.Move(consumedDirectory, recycleConsumedDirectory);
+            }
 
             try
             {
                 var recyclePaths = volumes.SourcePaths.ToList();
-                if (Directory.Exists(consumedDirectory)) recyclePaths.Add(consumedDirectory);
+                if (Directory.Exists(recycleConsumedDirectory)) recyclePaths.Add(recycleConsumedDirectory);
                 await _recycler.RecycleAsync(recyclePaths, cancellationToken).ConfigureAwait(false);
                 return new ExtractionResult(targetDirectory, true, null);
             }
@@ -74,274 +78,345 @@ public sealed partial class ArchiveExtractionService
                 return new ExtractionResult(targetDirectory, false, $"Extraction completed, but source archives were not moved to the recycle bin: {exception.Message}");
             }
         }
-        finally
+        catch (OperationCanceledException)
         {
-            if (Directory.Exists(workingDirectory)) Directory.Delete(workingDirectory, recursive: true);
-            if (!published && Directory.Exists(consumedDirectory)) Directory.Delete(consumedDirectory, recursive: true);
-        }
-    }
-
-    private static async Task<EngineExecutionResult> RunExtractionWithProgressAsync(
-        string extractionDirectory,
-        IProgress<ExtractionProgress>? progress,
-        Task<EngineExecutionResult> extractionTask,
-        CancellationToken cancellationToken)
-    {
-        if (progress is null) return await extractionTask.ConfigureAwait(false);
-
-        using var monitorCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var started = Stopwatch.GetTimestamp();
-        var monitorTask = MonitorExtractionDirectoryAsync(extractionDirectory, progress, started, monitorCancellation.Token);
-        try
-        {
-            return await extractionTask.ConfigureAwait(false);
+            canceled = true;
+            operations.ReportTerminalCancellation();
+            PreserveIncompleteDirectory(workingDirectory, sourceDirectory, candidate.LogicalName);
+            throw;
         }
         finally
         {
-            monitorCancellation.Cancel();
-            await monitorTask.ConfigureAwait(false);
-            ReportExtractionProgress(extractionDirectory, progress, started);
+            if (!canceled && Directory.Exists(workingDirectory)) Directory.Delete(workingDirectory, recursive: true);
+            if (!published && !canceled && Directory.Exists(consumedDirectory)) Directory.Delete(consumedDirectory, recursive: true);
         }
     }
 
-    private static async Task MonitorExtractionDirectoryAsync(
-        string extractionDirectory,
-        IProgress<ExtractionProgress> progress,
-        long started,
+    private async Task ExtractArchiveAsync(
+        ArchiveContext archive,
+        ArchiveVolumeSet volumes,
+        string workingDirectory,
+        string contentsDirectory,
+        IReadOnlyList<string>? passwords,
+        IProgress<ExtractionProgress>? legacyProgress,
+        OperationReporter operations,
+        Func<ArchivePasswordRequest, CancellationToken, Task<string?>>? passwordProvider,
+        Action<string>? passwordAccepted,
         CancellationToken cancellationToken)
     {
-        ReportExtractionProgress(extractionDirectory, progress, started);
-        while (!cancellationToken.IsCancellationRequested)
+        var needsPreparation = archive.Candidate.ArchiveOffset > 0 || volumes.CanonicalNames.Count > 0;
+        string enginePath;
+        if (needsPreparation)
         {
-            try
-            {
-                await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                return;
-            }
-
-            ReportExtractionProgress(extractionDirectory, progress, started);
+            using var prepare = operations.Start(ArchiveOperationKind.PrepareInput);
+            enginePath = await PrepareEngineArchivePathAsync(archive.Candidate, volumes, workingDirectory, prepare, cancellationToken).ConfigureAwait(false);
+            prepare.Complete();
         }
-    }
+        else
+        {
+            enginePath = volumes.PrimaryPath;
+        }
 
-    private static void ReportExtractionProgress(string extractionDirectory, IProgress<ExtractionProgress> progress, long started)
-    {
-        var fileCount = 0;
-        long bytes = 0;
+        var selection = await SelectEngineAsync(archive, enginePath, passwords, operations, passwordProvider, passwordAccepted, cancellationToken).ConfigureAwait(false);
+        using var extract = operations.Start(ArchiveOperationKind.Extract, selection.Engine.Descriptor.DisplayName);
+        var engineProgress = new Progress<ArchiveEngineProgress>(value =>
+        {
+            if (value.Percent is double percent)
+            {
+                extract.Report(bytes: 0, total: selection.TotalBytes, percent: ClampActivePercent(percent), precision: ArchiveProgressPrecision.Exact);
+            }
+        });
+
+        EngineExecutionResult result;
         try
         {
-            if (Directory.Exists(extractionDirectory))
-            {
-                foreach (var path in Directory.EnumerateFiles(extractionDirectory, "*", SearchOption.AllDirectories))
-                {
-                    try
-                    {
-                        bytes += new FileInfo(path).Length;
-                        fileCount++;
-                    }
-                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-                    {
-                        // A file may still be moving or being written by the engine.
-                    }
-                }
-            }
+            result = await RunExtractionWithProgressAsync(
+                contentsDirectory,
+                legacyProgress,
+                extract,
+                selection.TotalBytes,
+                selection.Password is null
+                    ? selection.Engine.ExtractAsync(enginePath, contentsDirectory, engineProgress, cancellationToken)
+                    : ((IPasswordArchiveEngine)selection.Engine).ExtractWithPasswordAsync(enginePath, contentsDirectory, selection.Password, engineProgress, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        {
-            // The directory can briefly be unavailable while an engine creates it.
-        }
-
-        progress.Report(new ExtractionProgress(fileCount, bytes, Stopwatch.GetElapsedTime(started)));
+        catch (OperationCanceledException) { extract.Cancel(); throw; }
+        catch { extract.Fail(); throw; }
+        if (!result.Succeeded) throw new InvalidDataException($"{selection.Engine.Descriptor.DisplayName} could not extract the archive.");
+        extract.Complete(percent: 100, precision: ArchiveProgressPrecision.Exact);
     }
 
-    private async Task ProcessNestedArchivesAsync(string rootDirectory, string workingDirectory, string consumedDirectory, IReadOnlyList<string>? passwords, IProgress<ExtractionProgress>? progress, CancellationToken cancellationToken)
+    private async Task ProcessNestedArchivesAsync(
+        string rootDirectory,
+        string workingDirectory,
+        string consumedDirectory,
+        ArchiveContext rootArchive,
+        IReadOnlyList<string>? passwords,
+        IProgress<ExtractionProgress>? legacyProgress,
+        OperationReporter rootOperations,
+        Func<ArchivePasswordRequest, CancellationToken, Task<string?>>? passwordProvider,
+        Action<string>? passwordAccepted,
+        CancellationToken cancellationToken)
     {
         var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var archiveRoots = new List<(string Directory, ArchiveContext Archive)> { (rootDirectory, rootArchive) };
         for (var depth = 0; ; depth++)
         {
+            using var scan = rootOperations.Start(ArchiveOperationKind.ScanNested);
             var candidates = ArchiveCandidateDiscovery.Discover([rootDirectory], cancellationToken)
                 .Where(candidate => processed.Add(Path.GetFullPath(candidate.Path)))
                 .ToArray();
+            scan.Complete(fileCount: candidates.Length);
             if (candidates.Length == 0) return;
             if (depth >= MaximumNestedDepth) throw new InvalidDataException($"Nested archive depth exceeds the configured limit of {MaximumNestedDepth}.");
 
             foreach (var nested in candidates)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                await ExtractNestedArchiveAsync(nested, workingDirectory, consumedDirectory, passwords, progress, cancellationToken).ConfigureAwait(false);
+                var parent = archiveRoots
+                    .Where(item => nested.Path.StartsWith(item.Directory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(item => item.Directory.Length)
+                    .Select(item => item.Archive)
+                    .FirstOrDefault() ?? rootArchive;
+                var nestedArchive = new ArchiveContext(nested, Guid.NewGuid(), parent.Id);
+                var nestedOperations = rootOperations.ForArchive(nestedArchive);
+                var outputDirectory = await ExtractNestedArchiveAsync(nestedArchive, workingDirectory, consumedDirectory, passwords, legacyProgress, nestedOperations, passwordProvider, passwordAccepted, cancellationToken).ConfigureAwait(false);
+                archiveRoots.Add((outputDirectory, nestedArchive));
             }
         }
     }
 
-    private async Task ExtractNestedArchiveAsync(ArchiveCandidate candidate, string workingDirectory, string consumedDirectory, IReadOnlyList<string>? passwords, IProgress<ExtractionProgress>? progress, CancellationToken cancellationToken)
+    private async Task<string> ExtractNestedArchiveAsync(
+        ArchiveContext archive,
+        string workingDirectory,
+        string consumedDirectory,
+        IReadOnlyList<string>? passwords,
+        IProgress<ExtractionProgress>? legacyProgress,
+        OperationReporter operations,
+        Func<ArchivePasswordRequest, CancellationToken, Task<string?>>? passwordProvider,
+        Action<string>? passwordAccepted,
+        CancellationToken cancellationToken)
     {
         var nestedWorkingDirectory = Path.Combine(workingDirectory, $"nested-{Guid.NewGuid():N}");
         var nestedContentsDirectory = Path.Combine(nestedWorkingDirectory, "contents");
+        var canceled = false;
         try
         {
-            var volumes = ArchiveVolumeResolver.Resolve(candidate);
+            var volumes = ArchiveVolumeResolver.Resolve(archive.Candidate);
             if (!volumes.IsComplete) throw new InvalidDataException(volumes.IncompleteReason);
             Directory.CreateDirectory(nestedContentsDirectory);
-            var engineArchivePath = await PrepareEngineArchivePathAsync(candidate, volumes, nestedWorkingDirectory, cancellationToken).ConfigureAwait(false);
-            var selection = await SelectEngineAsync(candidate, engineArchivePath, passwords, cancellationToken).ConfigureAwait(false);
-            var extraction = await RunExtractionWithProgressAsync(
-                nestedContentsDirectory,
-                progress,
-                selection.Password is null
-                    ? selection.Engine.ExtractAsync(engineArchivePath, nestedContentsDirectory, cancellationToken)
-                    : ((IPasswordArchiveEngine)selection.Engine).ExtractWithPasswordAsync(engineArchivePath, nestedContentsDirectory, selection.Password, cancellationToken),
-                cancellationToken).ConfigureAwait(false);
-            if (!extraction.Succeeded) throw new InvalidDataException($"{selection.Engine.Descriptor.DisplayName} could not extract nested archive {candidate.Path}.");
-
-            NormalizeOutputTree(nestedContentsDirectory, cancellationToken);
-            var targetDirectory = ReserveTargetDirectory(Path.GetDirectoryName(candidate.Path)!, candidate.LogicalName);
+            await ExtractArchiveAsync(archive, volumes, nestedWorkingDirectory, nestedContentsDirectory, passwords, legacyProgress, operations, passwordProvider, passwordAccepted, cancellationToken).ConfigureAwait(false);
+            await RunSynchronousOperationAsync(operations, ArchiveOperationKind.Normalize, null, cancellationToken, () => NormalizeOutputTree(nestedContentsDirectory, cancellationToken)).ConfigureAwait(false);
+            var targetDirectory = ReserveTargetDirectory(Path.GetDirectoryName(archive.Candidate.Path)!, archive.Candidate.LogicalName);
             Directory.CreateDirectory(consumedDirectory);
             foreach (var sourcePath in volumes.SourcePaths)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 File.Move(sourcePath, Path.Combine(consumedDirectory, $"{Guid.NewGuid():N}-{Path.GetFileName(sourcePath)}"));
             }
             Directory.Move(nestedContentsDirectory, targetDirectory);
+            return targetDirectory;
+        }
+        catch (OperationCanceledException)
+        {
+            canceled = true;
+            throw;
         }
         finally
         {
-            if (Directory.Exists(nestedWorkingDirectory)) Directory.Delete(nestedWorkingDirectory, recursive: true);
+            if (!canceled && Directory.Exists(nestedWorkingDirectory)) Directory.Delete(nestedWorkingDirectory, recursive: true);
         }
     }
 
     private async Task<EngineSelection> SelectEngineAsync(
-        ArchiveCandidate candidate,
+        ArchiveContext archive,
         string archivePath,
         IReadOnlyList<string>? passwords,
+        OperationReporter operations,
+        Func<ArchivePasswordRequest, CancellationToken, Task<string?>>? passwordProvider,
+        Action<string>? passwordAccepted,
         CancellationToken cancellationToken)
     {
-        var passwordRequired = false;
-        var attemptedPasswords = 0;
-        foreach (var engine in OrderEngines(candidate.RecognitionEngineKind))
+        foreach (var engine in OrderEngines(archive.Candidate.RecognitionEngineKind))
         {
             cancellationToken.ThrowIfCancellationRequested();
             ArchiveRecognitionResult recognition;
-            try
+            using (var recognize = operations.Start(ArchiveOperationKind.Recognize, engine.Descriptor.DisplayName))
             {
-                recognition = await engine.RecognizeAsync(archivePath, cancellationToken).ConfigureAwait(false);
+                try { recognition = await engine.RecognizeAsync(archivePath, cancellationToken).ConfigureAwait(false); }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
+                {
+                    recognize.Fail();
+                    continue;
+                }
+                if (!recognition.CanExtract) { recognize.Fail(); continue; }
+                recognize.Complete();
             }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
-            {
-                continue;
-            }
-            if (!recognition.CanExtract) continue;
 
             ArchiveRecognitionResult validation;
-            try
+            using (var validate = operations.Start(ArchiveOperationKind.Validate, engine.Descriptor.DisplayName))
             {
-                validation = await engine.ValidateAsync(archivePath, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
-            {
-                continue;
-            }
-            if (validation.Status == ArchiveRecognitionStatus.Recognized) return new EngineSelection(engine, null);
-            if (validation.Status != ArchiveRecognitionStatus.PasswordRequired || engine is not IPasswordArchiveEngine passwordEngine) continue;
+                try { validation = await engine.ValidateAsync(archivePath, progress: null, cancellationToken).ConfigureAwait(false); }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
+                {
+                    validate.Fail();
+                    continue;
+                }
+                if (validation.Status == ArchiveRecognitionStatus.Recognized)
+                {
+                    validate.Complete();
+                    return new EngineSelection(engine, null, validation.TotalUncompressedBytes ?? recognition.TotalUncompressedBytes);
+                }
+                if (validation.Status != ArchiveRecognitionStatus.PasswordRequired || engine is not IPasswordArchiveEngine passwordEngine)
+                {
+                    validate.Fail();
+                    continue;
+                }
+                validate.Complete();
 
-            passwordRequired = true;
-            foreach (var password in passwords ?? [])
-            {
-                if (string.IsNullOrEmpty(password)) continue;
-                attemptedPasswords++;
-                var result = await passwordEngine.TestWithPasswordAsync(archivePath, password, cancellationToken).ConfigureAwait(false);
-                if (result.Succeeded) return new EngineSelection(engine, password);
-            }
-        }
+                // PasswordRequired confirms this archive. Do not run another engine's full validation.
+                var attempted = 0;
+                foreach (var password in passwords ?? [])
+                {
+                    if (string.IsNullOrEmpty(password)) continue;
+                    attempted++;
+                    using var test = operations.Start(ArchiveOperationKind.Password, engine.Descriptor.DisplayName);
+                    if ((await passwordEngine.TestWithPasswordAsync(archivePath, password, progress: null, cancellationToken).ConfigureAwait(false)).Succeeded)
+                    {
+                        test.Complete();
+                        return new EngineSelection(engine, password, validation.TotalUncompressedBytes ?? recognition.TotalUncompressedBytes);
+                    }
+                    test.Fail();
+                }
 
-        if (passwordRequired)
-        {
-            throw new ArchivePasswordRequiredException(candidate.Path, attemptedPasswords);
+                if (passwordProvider is null) throw new ArchivePasswordRequiredException(archive.Candidate.Path, attempted);
+                while (true)
+                {
+                    using var wait = operations.Start(ArchiveOperationKind.Password, engine.Descriptor.DisplayName, ArchiveOperationState.WaitingForPassword);
+                    var password = await passwordProvider(new ArchivePasswordRequest(archive.Id, archive.ParentId, archive.Candidate.LogicalName, archive.Candidate.Path, engine.Descriptor.DisplayName, attempted), cancellationToken).ConfigureAwait(false);
+                    if (string.IsNullOrEmpty(password)) throw new OperationCanceledException(cancellationToken);
+                    attempted++;
+                    wait.Running();
+                    if ((await passwordEngine.TestWithPasswordAsync(archivePath, password, progress: null, cancellationToken).ConfigureAwait(false)).Succeeded)
+                    {
+                        wait.Complete();
+                        passwordAccepted?.Invoke(password);
+                        return new EngineSelection(engine, password, validation.TotalUncompressedBytes ?? recognition.TotalUncompressedBytes);
+                    }
+                    wait.Fail();
+                }
+            }
         }
 
         throw new InvalidDataException("No installed archive engine could validate the selected archive.");
     }
 
-    private IEnumerable<IArchiveEngine> OrderEngines(ArchiveEngineKind? recognitionEngineKind) =>
-        recognitionEngineKind is null
-            ? _engines
-            : _engines.OrderBy(engine => engine.Descriptor.Kind == recognitionEngineKind ? 0 : 1);
-
-    private static async Task<string> PrepareEngineArchivePathAsync(
-        ArchiveCandidate candidate,
-        ArchiveVolumeSet volumes,
-        string workingDirectory,
+    private async Task<EngineExecutionResult> RunExtractionWithProgressAsync(
+        string extractionDirectory,
+        IProgress<ExtractionProgress>? legacyProgress,
+        OperationScope operation,
+        long? totalBytes,
+        Task<EngineExecutionResult> extractionTask,
         CancellationToken cancellationToken)
+    {
+        using var monitorCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var started = Stopwatch.GetTimestamp();
+        var monitorTask = MonitorExtractionDirectoryAsync(extractionDirectory, legacyProgress, operation, totalBytes, started, monitorCancellation.Token);
+        try { return await extractionTask.ConfigureAwait(false); }
+        finally
+        {
+            monitorCancellation.Cancel();
+            await monitorTask.ConfigureAwait(false);
+            ReportExtractionProgress(extractionDirectory, legacyProgress, operation, totalBytes, started);
+        }
+    }
+
+    private static async Task MonitorExtractionDirectoryAsync(string directory, IProgress<ExtractionProgress>? legacy, OperationScope operation, long? total, long started, CancellationToken cancellationToken)
+    {
+        ReportExtractionProgress(directory, legacy, operation, total, started);
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try { await Task.Delay(TimeSpan.FromMilliseconds(350), cancellationToken).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+            ReportExtractionProgress(directory, legacy, operation, total, started);
+        }
+    }
+
+    private static void ReportExtractionProgress(string directory, IProgress<ExtractionProgress>? legacy, OperationScope operation, long? total, long started)
+    {
+        var (count, bytes) = GetDirectoryActivity(directory);
+        var elapsed = Stopwatch.GetElapsedTime(started);
+        legacy?.Report(new ExtractionProgress(count, bytes, elapsed));
+        double? percent = total is > 0 ? ClampActivePercent(bytes * 100d / total.Value) : null;
+        operation.Report(count, bytes, total, percent, total is > 0 ? ArchiveProgressPrecision.Estimated : ArchiveProgressPrecision.Indeterminate);
+    }
+
+    private static (int Count, long Bytes) GetDirectoryActivity(string directory)
+    {
+        var count = 0; long bytes = 0;
+        try
+        {
+            if (Directory.Exists(directory)) foreach (var path in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+            {
+                try { bytes += new FileInfo(path).Length; count++; } catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+        return (count, bytes);
+    }
+
+    private static double ClampActivePercent(double percent) => Math.Clamp(percent, 0, 99);
+
+    private static async Task RunSynchronousOperationAsync(OperationReporter operations, ArchiveOperationKind kind, string? engine, CancellationToken cancellationToken, Action action)
+    {
+        using var operation = operations.Start(kind, engine);
+        try { await Task.Run(action, cancellationToken).ConfigureAwait(false); operation.Complete(); }
+        catch (OperationCanceledException) { operation.Cancel(); throw; }
+        catch { operation.Fail(); throw; }
+    }
+
+    private IEnumerable<IArchiveEngine> OrderEngines(ArchiveEngineKind? kind) => kind is null ? _engines : _engines.OrderBy(engine => engine.Descriptor.Kind == kind ? 0 : 1);
+
+    private static async Task<string> PrepareEngineArchivePathAsync(ArchiveCandidate candidate, ArchiveVolumeSet volumes, string workingDirectory, OperationScope operation, CancellationToken cancellationToken)
     {
         if (candidate.ArchiveOffset > 0)
         {
-            if (volumes.SourcePaths.Count != 1 || !string.Equals(volumes.PrimaryPath, candidate.Path, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidDataException("An embedded archive cannot be combined with a multi-volume archive set.");
-            }
-
+            if (volumes.SourcePaths.Count != 1 || !string.Equals(volumes.PrimaryPath, candidate.Path, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("An embedded archive cannot be combined with a multi-volume archive set.");
             var sourceLength = new FileInfo(candidate.Path).Length;
-            if (candidate.ArchiveLength <= 0 ||
-                candidate.ArchiveOffset >= sourceLength ||
-                candidate.ArchiveLength > sourceLength - candidate.ArchiveOffset)
-            {
-                throw new InvalidDataException("The embedded archive range is outside the source file.");
-            }
-
-            var embeddedDirectory = Path.Combine(workingDirectory, "embedded-archive");
-            Directory.CreateDirectory(embeddedDirectory);
-            var embeddedPath = Path.Combine(embeddedDirectory, GetEmbeddedArchiveName(candidate.Format));
-            await using var source = new FileStream(
-                candidate.Path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.Read,
-                bufferSize: 1024 * 1024,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            if (candidate.ArchiveLength <= 0 || candidate.ArchiveOffset >= sourceLength || candidate.ArchiveLength > sourceLength - candidate.ArchiveOffset) throw new InvalidDataException("The embedded archive range is outside the source file.");
+            var directory = Path.Combine(workingDirectory, "embedded-archive"); Directory.CreateDirectory(directory);
+            var path = Path.Combine(directory, GetEmbeddedArchiveName(candidate.Format));
+            await using var source = new FileStream(candidate.Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
             source.Position = candidate.ArchiveOffset;
-            await using var destination = new FileStream(
-                embeddedPath,
-                FileMode.CreateNew,
-                FileAccess.Write,
-                FileShare.None,
-                bufferSize: 1024 * 1024,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
-            var buffer = GC.AllocateUninitializedArray<byte>(1024 * 1024);
-            var remaining = candidate.ArchiveLength;
+            await using var destination = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            var buffer = GC.AllocateUninitializedArray<byte>(1024 * 1024); var remaining = candidate.ArchiveLength; long copied = 0;
             while (remaining > 0)
             {
-                var count = await source.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), cancellationToken).ConfigureAwait(false);
-                if (count == 0) throw new EndOfStreamException("The source file ended before the embedded archive was copied.");
-                await destination.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
-                remaining -= count;
+                var read = await source.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), cancellationToken).ConfigureAwait(false);
+                if (read == 0) throw new EndOfStreamException("The source file ended before the embedded archive was copied.");
+                await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                remaining -= read; copied += read;
+                operation.Report(0, copied, candidate.ArchiveLength, ClampActivePercent(copied * 100d / candidate.ArchiveLength), ArchiveProgressPrecision.Exact);
             }
             await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
-            return embeddedPath;
+            return path;
         }
-
         if (volumes.CanonicalNames.Count == 0) return volumes.PrimaryPath;
-
-        var aliasDirectory = Path.Combine(workingDirectory, "volume-aliases");
-        Directory.CreateDirectory(aliasDirectory);
+        var aliases = Path.Combine(workingDirectory, "volume-aliases"); Directory.CreateDirectory(aliases);
         foreach (var sourcePath in volumes.SourcePaths)
         {
-            if (!volumes.CanonicalNames.TryGetValue(sourcePath, out var canonicalName))
-            {
-                throw new InvalidDataException("The archive volume alias set is incomplete.");
-            }
-
-            var aliasPath = Path.Combine(aliasDirectory, canonicalName);
-            try
-            {
-                CreateHardLink(aliasPath, sourcePath);
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
-            {
-                throw new InvalidOperationException("EasyUnpack could not create safe temporary names for the renamed archive volumes.", exception);
-            }
+            if (!volumes.CanonicalNames.TryGetValue(sourcePath, out var name)) throw new InvalidDataException("The archive volume alias set is incomplete.");
+            CreateHardLink(Path.Combine(aliases, name), sourcePath);
         }
+        return Path.Combine(aliases, volumes.CanonicalNames[volumes.PrimaryPath]);
+    }
 
-        return Path.Combine(aliasDirectory, volumes.CanonicalNames[volumes.PrimaryPath]);
+    private static void PreserveIncompleteDirectory(string workingDirectory, string sourceDirectory, string logicalName)
+    {
+        if (!Directory.Exists(workingDirectory)) return;
+        try { Directory.Move(workingDirectory, ReserveTargetDirectory(sourceDirectory, logicalName + " - 未完成")); }
+        catch (IOException) { /* Preserve the original hidden staging directory if a rename cannot be made. */ }
+        catch (UnauthorizedAccessException) { }
     }
 
     private static void CreateHardLink(string linkPath, string existingPath)
@@ -349,96 +424,71 @@ public sealed partial class ArchiveExtractionService
         if (CreateHardLinkNative(linkPath, existingPath, IntPtr.Zero)) return;
         throw new IOException("Windows could not create a temporary archive-volume hard link.", new Win32Exception(Marshal.GetLastWin32Error()));
     }
-
-    [DllImport("kernel32.dll", EntryPoint = "CreateHardLinkW", SetLastError = true, CharSet = CharSet.Unicode)]
-    [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", EntryPoint = "CreateHardLinkW", SetLastError = true, CharSet = CharSet.Unicode)] [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CreateHardLinkNative(string fileName, string existingFileName, IntPtr securityAttributes);
 
     private static string GetEmbeddedArchiveName(ArchiveFormat format) => format switch
     {
-        ArchiveFormat.SevenZip => "payload.7z",
-        ArchiveFormat.Rar or ArchiveFormat.Rar5 => "payload.rar",
-        ArchiveFormat.Zip => "payload.zip",
-        ArchiveFormat.Tar => "payload.tar",
-        ArchiveFormat.GZip => "payload.gz",
-        ArchiveFormat.BZip2 => "payload.bz2",
-        ArchiveFormat.Xz => "payload.xz",
-        ArchiveFormat.Zstandard => "payload.zst",
-        ArchiveFormat.Cab => "payload.cab",
-        ArchiveFormat.Arj => "payload.arj",
-        ArchiveFormat.Lzh => "payload.lzh",
-        _ => "payload.bin",
+        ArchiveFormat.SevenZip => "payload.7z", ArchiveFormat.Rar or ArchiveFormat.Rar5 => "payload.rar", ArchiveFormat.Zip => "payload.zip", ArchiveFormat.Tar => "payload.tar", ArchiveFormat.GZip => "payload.gz", ArchiveFormat.BZip2 => "payload.bz2", ArchiveFormat.Xz => "payload.xz", ArchiveFormat.Zstandard => "payload.zst", ArchiveFormat.Cab => "payload.cab", ArchiveFormat.Arj => "payload.arj", ArchiveFormat.Lzh => "payload.lzh", _ => "payload.bin",
     };
 
     private static void NormalizeOutputTree(string directory, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        while (TryGetOnlyOrdinaryChildDirectory(directory, out var onlyChild))
-        {
-            LiftChildContents(directory, onlyChild, cancellationToken);
-        }
-
-        foreach (var childDirectory in Directory.GetDirectories(directory))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (IsReparsePoint(childDirectory)) continue;
-            NormalizeOutputTree(childDirectory, cancellationToken);
-        }
+        while (TryGetOnlyOrdinaryChildDirectory(directory, out var child)) LiftChildContents(directory, child, cancellationToken);
+        foreach (var childDirectory in Directory.GetDirectories(directory)) { cancellationToken.ThrowIfCancellationRequested(); if (!IsReparsePoint(childDirectory)) NormalizeOutputTree(childDirectory, cancellationToken); }
     }
-
     private static bool TryGetOnlyOrdinaryChildDirectory(string directory, out string childDirectory)
     {
         var entries = Directory.GetFileSystemEntries(directory);
-        if (entries.Length == 1 && Directory.Exists(entries[0]) && !IsReparsePoint(entries[0]))
-        {
-            childDirectory = entries[0];
-            return true;
-        }
-
-        childDirectory = string.Empty;
-        return false;
+        if (entries.Length == 1 && Directory.Exists(entries[0]) && !IsReparsePoint(entries[0])) { childDirectory = entries[0]; return true; }
+        childDirectory = string.Empty; return false;
     }
-
     private static void LiftChildContents(string directory, string childDirectory, CancellationToken cancellationToken)
     {
-        var parentDirectory = Path.GetDirectoryName(directory)
-            ?? throw new InvalidOperationException("The extraction directory cannot be a file-system root.");
-        string temporaryDirectory;
-        do
+        var parent = Path.GetDirectoryName(directory) ?? throw new InvalidOperationException("The extraction directory cannot be a file-system root.");
+        var temporary = Path.Combine(parent, $".easyunpack-flatten-{Guid.NewGuid():N}"); Directory.Move(childDirectory, temporary);
+        foreach (var entry in Directory.GetFileSystemEntries(temporary))
         {
-            temporaryDirectory = Path.Combine(parentDirectory, $".easyunpack-flatten-{Guid.NewGuid():N}");
+            cancellationToken.ThrowIfCancellationRequested(); var destination = Path.Combine(directory, Path.GetFileName(entry));
+            if ((File.GetAttributes(entry) & FileAttributes.Directory) != 0) Directory.Move(entry, destination); else File.Move(entry, destination);
         }
-        while (Directory.Exists(temporaryDirectory) || File.Exists(temporaryDirectory));
-
-        Directory.Move(childDirectory, temporaryDirectory);
-        foreach (var entry in Directory.GetFileSystemEntries(temporaryDirectory))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var destination = Path.Combine(directory, Path.GetFileName(entry));
-            if ((File.GetAttributes(entry) & FileAttributes.Directory) != 0)
-            {
-                Directory.Move(entry, destination);
-            }
-            else
-            {
-                File.Move(entry, destination);
-            }
-        }
-        Directory.Delete(temporaryDirectory);
+        Directory.Delete(temporary);
     }
-
     private static bool IsReparsePoint(string path) => (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
-
     private static string ReserveTargetDirectory(string sourceDirectory, string logicalName)
     {
         var candidate = Path.Combine(sourceDirectory, logicalName);
-        for (var index = 2; Directory.Exists(candidate) || File.Exists(candidate); ++index)
-        {
-            candidate = Path.Combine(sourceDirectory, $"{logicalName} ({index})");
-        }
-
+        for (var index = 2; Directory.Exists(candidate) || File.Exists(candidate); index++) candidate = Path.Combine(sourceDirectory, $"{logicalName} ({index})");
         return candidate;
     }
 
-    private sealed record EngineSelection(IArchiveEngine Engine, string? Password);
+    private sealed record ArchiveContext(ArchiveCandidate Candidate, Guid Id, Guid? ParentId);
+    private sealed record EngineSelection(IArchiveEngine Engine, string? Password, long? TotalBytes);
+
+    private sealed class OperationReporter(IProgress<ArchiveOperationUpdate>? progress, ArchiveContext archive)
+    {
+        private readonly IProgress<ArchiveOperationUpdate>? _progress = progress;
+        private readonly ArchiveContext _archive = archive;
+        private OperationScope? _last;
+        public OperationReporter ForArchive(ArchiveContext child) => new(_progress, child);
+        public OperationScope Start(ArchiveOperationKind kind, string? engine = null, ArchiveOperationState state = ArchiveOperationState.Running)
+        {
+            var scope = new OperationScope(_progress, _archive, kind, engine, state); _last = scope; return scope;
+        }
+        public void ReportTerminalCancellation() => _last?.Cancel();
+    }
+
+    private sealed class OperationScope : IDisposable
+    {
+        private readonly IProgress<ArchiveOperationUpdate>? _progress; private readonly ArchiveContext _archive; private readonly ArchiveOperationKind _kind; private readonly string? _engine; private readonly Guid _id = Guid.NewGuid(); private readonly long _started = Stopwatch.GetTimestamp(); private bool _terminal;
+        public OperationScope(IProgress<ArchiveOperationUpdate>? progress, ArchiveContext archive, ArchiveOperationKind kind, string? engine, ArchiveOperationState state) { _progress = progress; _archive = archive; _kind = kind; _engine = engine; Send(state, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate); }
+        public void Running() => Send(ArchiveOperationState.Running, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate);
+        public void Report(int fileCount = 0, long bytes = 0, long? total = null, double? percent = null, ArchiveProgressPrecision precision = ArchiveProgressPrecision.Indeterminate) => Send(ArchiveOperationState.Running, fileCount, bytes, total, percent, precision);
+        public void Complete(int fileCount = 0, long bytes = 0, long? total = null, double? percent = 100, ArchiveProgressPrecision precision = ArchiveProgressPrecision.Exact) { _terminal = true; Send(ArchiveOperationState.Completed, fileCount, bytes, total, percent, precision); }
+        public void Fail() { _terminal = true; Send(ArchiveOperationState.Failed, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate); }
+        public void Cancel() { _terminal = true; Send(ArchiveOperationState.Canceled, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate); }
+        private void Send(ArchiveOperationState state, int files, long bytes, long? total, double? percent, ArchiveProgressPrecision precision) => _progress?.Report(new ArchiveOperationUpdate(_archive.Id, _archive.ParentId, _id, _kind, state, _archive.Candidate.LogicalName, _archive.Candidate.Path, _engine, Stopwatch.GetElapsedTime(_started), bytes, total, files, percent, precision));
+        public void Dispose() { if (!_terminal) { } }
+    }
 }
