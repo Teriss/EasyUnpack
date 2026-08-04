@@ -104,6 +104,12 @@ EasyUnpack 1.0.3 已完成核心自动解压、密码库、嵌套处理、媒体
 
 [Teriss/EasyUnpack](https://github.com/Teriss/EasyUnpack)
 
+## Settings and password visibility
+
+The installer creates an EasyUnpack shortcut in the Start Menu. Launching it without a selected archive opens engine settings; the password vault is available from that settings window.
+
+Password entries remain masked by default. The vault window can temporarily reveal the whole list in memory, and closing the window restores masking. The vault file format and master-password protection are unchanged; plaintext passwords are not written to logs, screenshots, clipboard contents, or task history.
+
 ## 许可证
 
 本项目采用 [MIT License](LICENSE)。你可以自由使用、修改、商用和再分发，但请保留版权声明和许可证文本。

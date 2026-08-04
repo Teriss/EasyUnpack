@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Data;
 using EasyUnpack.Core.Passwords;
 
 namespace EasyUnpack.App;
@@ -15,10 +16,15 @@ public partial class PasswordVaultWindow : Window
     private bool _loaded;
     private bool _syncingPassword;
     private bool _passwordRevealed;
+    private bool _passwordListRevealed;
     private Point _dragStart;
     private Guid? _pendingDragId;
 
-    public PasswordVaultWindow() => InitializeComponent();
+    public PasswordVaultWindow()
+    {
+        InitializeComponent();
+        ((DataGridTextColumn)EntryList.Columns[3]).Binding = new Binding(nameof(VaultEntryRow.PasswordDisplay));
+    }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
@@ -56,6 +62,14 @@ public partial class PasswordVaultWindow : Window
     }
 
     private void NewEntry_Click(object sender, RoutedEventArgs e) => BeginNewEntry();
+
+    private void RevealAll_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_loaded) return;
+        _passwordListRevealed = !_passwordListRevealed;
+        RefreshEntries(EntryList.SelectedItem is VaultEntryRow selected ? selected.Entry.Id : null);
+        UpdateRevealAllButton();
+    }
 
     private async void SaveEntry_Click(object sender, RoutedEventArgs e)
     {
@@ -241,9 +255,15 @@ public partial class PasswordVaultWindow : Window
 
     private void RefreshEntries(Guid? selectedId = null)
     {
-        var rows = _vault.Entries.Select((entry, index) => new VaultEntryRow(entry, index + 1)).ToArray();
+        var rows = _vault.Entries.Select((entry, index) => new VaultEntryRow(entry, index + 1) { IsRevealed = _passwordListRevealed }).ToArray();
         EntryList.ItemsSource = rows;
         if (selectedId is Guid id) EntryList.SelectedItem = rows.FirstOrDefault(row => row.Entry.Id == id);
+    }
+
+    private void UpdateRevealAllButton()
+    {
+        RevealAllButton.Content = _passwordListRevealed ? "\uED1A" : "\uE890";
+        RevealAllButton.ToolTip = _passwordListRevealed ? "隐藏列表中的密码" : "显示列表中的密码";
     }
 
     private async Task SaveVaultAsync()
@@ -295,6 +315,8 @@ public partial class PasswordVaultWindow : Window
 
     private sealed record VaultEntryRow(PasswordEntry Entry, int Priority)
     {
+        public bool IsRevealed { get; init; }
+        public string PasswordDisplay => IsRevealed ? Entry.Value : MaskedPassword;
         public string Label => string.IsNullOrWhiteSpace(Entry.Label) ? "未命名" : Entry.Label;
         public string MaskedPassword => new('●', Math.Clamp(Entry.Value.Length, 6, 12));
         public int SuccessCount => Entry.SuccessCount;

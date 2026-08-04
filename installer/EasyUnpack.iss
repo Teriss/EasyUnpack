@@ -26,6 +26,9 @@ UninstallDisplayIcon={app}\{#AppExeName}
 Source: "..\artifacts\publish\app\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 Source: "..\artifacts\publish\shell\EasyUnpack.ShellExtension.dll"; DestDir: "{app}"; Flags: ignoreversion
 
+[Icons]
+Name: "{group}\EasyUnpack"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
+
 [Registry]
 Root: HKLM; Subkey: "Software\Classes\CLSID\{#ShellClsid}"; ValueType: string; ValueName: ""; ValueData: "EasyUnpack Explorer Command"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Classes\CLSID\{#ShellClsid}\InprocServer32"; ValueType: string; ValueName: ""; ValueData: "{app}\EasyUnpack.ShellExtension.dll"
