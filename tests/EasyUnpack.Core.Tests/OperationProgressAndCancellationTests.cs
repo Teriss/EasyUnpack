@@ -31,6 +31,60 @@ public sealed class OperationProgressAndCancellationTests : IDisposable
     }
 
     [Fact]
+    public async Task Password_vault_mismatches_share_one_waiting_operation_without_failures()
+    {
+        var path = await CreateArchiveAsync("protected.zip", "504B0304");
+        var engine = new ProtectedEngine("right");
+        var updates = new List<ArchiveOperationUpdate>();
+        using var cancellation = new CancellationTokenSource();
+        var waiting = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var task = new ArchiveExtractionService(engine, new RecordingRecycler()).ExtractAsync(
+            new ArchiveCandidate(path, ArchiveFormat.Zip, true),
+            passwords: ["wrong", "still-wrong"],
+            cancellationToken: cancellation.Token,
+            operationProgress: new InlineProgress<ArchiveOperationUpdate>(update =>
+            {
+                updates.Add(update);
+                if (update.Kind == ArchiveOperationKind.Password && update.State == ArchiveOperationState.WaitingForPassword) waiting.TrySetResult();
+            }),
+            passwordProvider: async (_, token) =>
+            {
+                await Task.WhenAny(waiting.Task, Task.Delay(Timeout.InfiniteTimeSpan, token));
+                token.ThrowIfCancellationRequested();
+                return null;
+            });
+
+        await waiting.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
+
+        var passwordUpdates = updates.Where(update => update.Kind == ArchiveOperationKind.Password).ToArray();
+        Assert.NotEmpty(passwordUpdates);
+        Assert.Single(passwordUpdates.Select(update => update.OperationId).Distinct());
+        Assert.DoesNotContain(passwordUpdates, update => update.State == ArchiveOperationState.Failed);
+        Assert.Contains(passwordUpdates, update => update.State == ArchiveOperationState.WaitingForPassword);
+    }
+
+    [Fact]
+    public async Task Wrong_interactive_password_retries_the_same_operation()
+    {
+        var path = await CreateArchiveAsync("retry.zip", "504B0304");
+        var engine = new ProtectedEngine("right");
+        var updates = new List<ArchiveOperationUpdate>();
+        var attempts = 0;
+        await new ArchiveExtractionService(engine, new RecordingRecycler()).ExtractAsync(
+            new ArchiveCandidate(path, ArchiveFormat.Zip, true),
+            operationProgress: new InlineProgress<ArchiveOperationUpdate>(updates.Add),
+            passwordProvider: (_, _) => Task.FromResult<string?>(++attempts == 1 ? "wrong" : "right"));
+
+        var passwordUpdates = updates.Where(update => update.Kind == ArchiveOperationKind.Password).ToArray();
+        Assert.Single(passwordUpdates.Select(update => update.OperationId).Distinct());
+        Assert.DoesNotContain(passwordUpdates, update => update.State == ArchiveOperationState.Failed);
+        Assert.Equal(2, passwordUpdates.Count(update => update.State == ArchiveOperationState.WaitingForPassword));
+        Assert.Equal(ArchiveOperationState.Completed, passwordUpdates[^1].State);
+    }
+
+    [Fact]
     public async Task Nested_archives_publish_distinct_parented_operation_progress()
     {
         var path = await CreateArchiveAsync("outer.rar", "526172211A0700");
@@ -44,6 +98,24 @@ public sealed class OperationProgressAndCancellationTests : IDisposable
         Assert.NotEqual(extracts[0].ArchiveId, extracts[1].ArchiveId);
         Assert.Contains(extracts, update => update.ParentArchiveId == extracts[0].ArchiveId || update.ParentArchiveId == extracts[1].ArchiveId);
         Assert.All(extracts, update => Assert.Equal(100, update.Percent));
+    }
+
+    [Fact]
+    public async Task Exact_progress_does_not_downgrade_when_directory_monitor_reports_estimates()
+    {
+        var path = await CreateArchiveAsync("progress.zip", "504B0304");
+        var updates = new List<ArchiveOperationUpdate>();
+        await new ArchiveExtractionService(new ProgressEngine(), new RecordingRecycler()).ExtractAsync(
+            new ArchiveCandidate(path, ArchiveFormat.Zip, true),
+            operationProgress: new InlineProgress<ArchiveOperationUpdate>(updates.Add));
+
+        var extracts = updates.Where(update => update.Kind == ArchiveOperationKind.Extract).ToArray();
+        var firstExact = Array.FindIndex(extracts, update => update.Precision == ArchiveProgressPrecision.Exact);
+        Assert.True(firstExact >= 0);
+        Assert.All(extracts.Skip(firstExact), update => Assert.Equal(ArchiveProgressPrecision.Exact, update.Precision));
+        var percents = extracts.Skip(firstExact).Where(update => update.Percent is not null).Select(update => update.Percent!.Value).ToArray();
+        Assert.Equal(percents.OrderBy(value => value), percents);
+        Assert.Equal(100, extracts[^1].Percent);
     }
 
     [Fact]
@@ -136,6 +208,23 @@ public sealed class OperationProgressAndCancellationTests : IDisposable
         {
             if (Path.GetFileName(archivePath) == "outer.rar") await File.WriteAllBytesAsync(Path.Combine(destinationDirectory, "inner.zip"), Convert.FromHexString("504B0304"), cancellationToken);
             else await File.WriteAllTextAsync(Path.Combine(destinationDirectory, "content.txt"), "content", cancellationToken);
+            return Success();
+        }
+    }
+
+    private sealed class ProgressEngine : IArchiveEngine
+    {
+        public ArchiveEngineDescriptor Descriptor { get; } = new(ArchiveEngineKind.SevenZip, "fake.exe", "progress");
+        public Task<ArchiveRecognitionResult> RecognizeAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(new ArchiveRecognitionResult(ArchiveRecognitionStatus.Recognized, ArchiveFormat.Zip));
+        public Task<ArchiveRecognitionResult> ValidateAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(new ArchiveRecognitionResult(ArchiveRecognitionStatus.Recognized, ArchiveFormat.Zip, 1000));
+        public Task<EngineExecutionResult> ListAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(Success());
+        public Task<EngineExecutionResult> TestAsync(string archivePath, CancellationToken cancellationToken = default) => Task.FromResult(Success());
+        public Task<EngineExecutionResult> ExtractAsync(string archivePath, string destinationDirectory, CancellationToken cancellationToken = default) => ExtractAsync(archivePath, destinationDirectory, null, cancellationToken);
+        public async Task<EngineExecutionResult> ExtractAsync(string archivePath, string destinationDirectory, IProgress<ArchiveEngineProgress>? progress, CancellationToken cancellationToken = default)
+        {
+            progress?.Report(new ArchiveEngineProgress(10));
+            progress?.Report(new ArchiveEngineProgress(40));
+            await File.WriteAllBytesAsync(Path.Combine(destinationDirectory, "content.bin"), new byte[1024], cancellationToken);
             return Success();
         }
     }

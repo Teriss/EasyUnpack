@@ -83,12 +83,11 @@ public partial class MainWindow : Window
             CancelCurrentTaskButton.IsEnabled = true;
             task.Status = "正在处理";
             SetStatus($"正在处理：{task.LogicalName}", StatusTone.Info);
-            var progress = new Progress<ExtractionProgress>(task.UpdateLegacyProgress);
             var operations = new Progress<ArchiveOperationUpdate>(update => AddOperation(task, update));
             string? acceptedPassword = null;
             try
             {
-                var result = await service.ExtractAsync(task.Candidate, vault.GetCandidates(), taskCancellation.Token, progress, operations,
+                var result = await service.ExtractAsync(task.Candidate, vault.GetCandidates(), taskCancellation.Token, progress: null, operationProgress: operations,
                     (request, _) => PromptPasswordAsync(request, taskCancellation.Token), password => acceptedPassword = password);
                 if (acceptedPassword is not null)
                 {
@@ -146,7 +145,7 @@ public partial class MainWindow : Window
         return await Dispatcher.InvokeAsync(() =>
         {
             if (cancellationToken.IsCancellationRequested) return null;
-            var dialog = new PasswordPromptWindow(request.ArchivePath) { Owner = this };
+            var dialog = new PasswordPromptWindow(request.ArchivePath, request.PreviousAttemptFailed) { Owner = this };
             return dialog.ShowDialog() == true ? dialog.Password : null;
         });
     }
@@ -204,6 +203,9 @@ public partial class MainWindow : Window
     private sealed class CandidateTaskItem(ArchiveCandidate candidate) : TaskRow
     {
         private readonly Dictionary<Guid, ArchiveTaskItem> _archives = [];
+        private int _bestProgressPrecision;
+        private double _bestProgressPercent;
+        private bool _hasProgress;
         public ArchiveCandidate Candidate { get; } = candidate;
         public override string LogicalName => Candidate.LogicalName; public override string Format => Candidate.Format.ToString(); public override string Path => Candidate.Path;
         public ArchiveTaskItem GetOrCreateArchive(ArchiveOperationUpdate update, ObservableCollection<TaskRow> rows)
@@ -219,8 +221,18 @@ public partial class MainWindow : Window
         public void UpdateFromOperation(ArchiveOperationUpdate update)
         {
             Status = update.State switch { ArchiveOperationState.WaitingForPassword => "等待密码", ArchiveOperationState.Failed => "失败", ArchiveOperationState.Canceled => "已取消", ArchiveOperationState.Completed => "处理中", _ => "正在处理" };
-            if (update.Percent is double percent) SetProgress(percent, false, FormatOperation(update));
-            else SetProgress(ProgressPercent, update.State == ArchiveOperationState.Running, FormatOperation(update));
+            var precision = PrecisionRank(update.Precision);
+            if (update.Percent is double percent && precision >= _bestProgressPrecision)
+            {
+                _bestProgressPrecision = precision;
+                _bestProgressPercent = Math.Max(_bestProgressPercent, percent);
+                _hasProgress = true;
+                SetProgress(_bestProgressPercent, false, FormatOperation(update));
+            }
+            else if (!_hasProgress && update.State == ArchiveOperationState.Running)
+            {
+                SetProgress(0, true, FormatOperation(update));
+            }
         }
     }
 
@@ -249,12 +261,24 @@ public partial class MainWindow : Window
         public void Apply(ArchiveOperationUpdate update)
         {
             Status = update.State switch { ArchiveOperationState.WaitingForPassword => "等待密码", ArchiveOperationState.Completed => "完成", ArchiveOperationState.Failed => "失败", ArchiveOperationState.Canceled => "已取消", _ => "进行中" };
-            var indeterminate = update.Precision == ArchiveProgressPrecision.Indeterminate && update.State == ArchiveOperationState.Running;
-            SetProgress(update.Percent ?? ProgressPercent, indeterminate, FormatOperation(update));
+            var indeterminate = update.Percent is null && update.Precision == ArchiveProgressPrecision.Indeterminate && update.State == ArchiveOperationState.Running;
+            if (update.Percent is double percent)
+            {
+                SetProgress(Math.Max(ProgressPercent, percent), false, FormatOperation(update));
+            }
+            else if (indeterminate)
+            {
+                SetProgress(ProgressPercent, true, FormatOperation(update));
+            }
+            else
+            {
+                SetProgress(ProgressPercent, false, FormatOperation(update));
+            }
         }
     }
 
     private static string OperationName(ArchiveOperationKind kind) => kind switch { ArchiveOperationKind.Recognize => "识别压缩包", ArchiveOperationKind.PrepareInput => "准备引擎文件", ArchiveOperationKind.Validate => "验证归档", ArchiveOperationKind.Password => "验证或等待密码", ArchiveOperationKind.Extract => "解压", ArchiveOperationKind.ScanNested => "扫描嵌套归档", ArchiveOperationKind.Normalize => "整理输出", ArchiveOperationKind.Publish => "发布输出", _ => kind.ToString() };
+    private static int PrecisionRank(ArchiveProgressPrecision precision) => precision switch { ArchiveProgressPrecision.Exact => 3, ArchiveProgressPrecision.Estimated => 2, _ => 1 };
     private static string FormatOperation(ArchiveOperationUpdate update)
     {
         var progress = update.Percent is double percent ? (update.Precision == ArchiveProgressPrecision.Estimated ? $"约 {percent:0}%" : $"{percent:0}%") : (update.State == ArchiveOperationState.WaitingForPassword ? "等待密码" : "进行中");

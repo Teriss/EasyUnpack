@@ -275,35 +275,34 @@ public sealed partial class ArchiveExtractionService
                 validate.Complete();
 
                 // PasswordRequired confirms this archive. Do not run another engine's full validation.
-                var attempted = 0;
+                // Keep all vault attempts and interactive retries on one operation row.
+                using var passwordOperation = operations.Start(ArchiveOperationKind.Password, engine.Descriptor.DisplayName, ArchiveOperationState.Running);
                 foreach (var password in passwords ?? [])
                 {
                     if (string.IsNullOrEmpty(password)) continue;
-                    attempted++;
-                    using var test = operations.Start(ArchiveOperationKind.Password, engine.Descriptor.DisplayName);
                     if ((await passwordEngine.TestWithPasswordAsync(archivePath, password, progress: null, cancellationToken).ConfigureAwait(false)).Succeeded)
                     {
-                        test.Complete();
+                        passwordOperation.Complete();
                         return new EngineSelection(engine, password, validation.TotalUncompressedBytes ?? recognition.TotalUncompressedBytes);
                     }
-                    test.Fail();
                 }
 
-                if (passwordProvider is null) throw new ArchivePasswordRequiredException(archive.Candidate.Path, attempted);
+                passwordOperation.Waiting();
+                if (passwordProvider is null) throw new ArchivePasswordRequiredException(archive.Candidate.Path, 0);
+                var previousAttemptFailed = false;
                 while (true)
                 {
-                    using var wait = operations.Start(ArchiveOperationKind.Password, engine.Descriptor.DisplayName, ArchiveOperationState.WaitingForPassword);
-                    var password = await passwordProvider(new ArchivePasswordRequest(archive.Id, archive.ParentId, archive.Candidate.LogicalName, archive.Candidate.Path, engine.Descriptor.DisplayName, attempted), cancellationToken).ConfigureAwait(false);
+                    var password = await passwordProvider(new ArchivePasswordRequest(archive.Id, archive.ParentId, archive.Candidate.LogicalName, archive.Candidate.Path, engine.Descriptor.DisplayName, 0, previousAttemptFailed), cancellationToken).ConfigureAwait(false);
                     if (string.IsNullOrEmpty(password)) throw new OperationCanceledException(cancellationToken);
-                    attempted++;
-                    wait.Running();
+                    passwordOperation.Running();
                     if ((await passwordEngine.TestWithPasswordAsync(archivePath, password, progress: null, cancellationToken).ConfigureAwait(false)).Succeeded)
                     {
-                        wait.Complete();
+                        passwordOperation.Complete();
                         passwordAccepted?.Invoke(password);
                         return new EngineSelection(engine, password, validation.TotalUncompressedBytes ?? recognition.TotalUncompressedBytes);
                     }
-                    wait.Fail();
+                    previousAttemptFailed = true;
+                    passwordOperation.Waiting();
                 }
             }
         }
@@ -481,14 +480,74 @@ public sealed partial class ArchiveExtractionService
 
     private sealed class OperationScope : IDisposable
     {
-        private readonly IProgress<ArchiveOperationUpdate>? _progress; private readonly ArchiveContext _archive; private readonly ArchiveOperationKind _kind; private readonly string? _engine; private readonly Guid _id = Guid.NewGuid(); private readonly long _started = Stopwatch.GetTimestamp(); private bool _terminal;
-        public OperationScope(IProgress<ArchiveOperationUpdate>? progress, ArchiveContext archive, ArchiveOperationKind kind, string? engine, ArchiveOperationState state) { _progress = progress; _archive = archive; _kind = kind; _engine = engine; Send(state, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate); }
-        public void Running() => Send(ArchiveOperationState.Running, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate);
-        public void Report(int fileCount = 0, long bytes = 0, long? total = null, double? percent = null, ArchiveProgressPrecision precision = ArchiveProgressPrecision.Indeterminate) => Send(ArchiveOperationState.Running, fileCount, bytes, total, percent, precision);
-        public void Complete(int fileCount = 0, long bytes = 0, long? total = null, double? percent = 100, ArchiveProgressPrecision precision = ArchiveProgressPrecision.Exact) { _terminal = true; Send(ArchiveOperationState.Completed, fileCount, bytes, total, percent, precision); }
-        public void Fail() { _terminal = true; Send(ArchiveOperationState.Failed, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate); }
-        public void Cancel() { _terminal = true; Send(ArchiveOperationState.Canceled, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate); }
-        private void Send(ArchiveOperationState state, int files, long bytes, long? total, double? percent, ArchiveProgressPrecision precision) => _progress?.Report(new ArchiveOperationUpdate(_archive.Id, _archive.ParentId, _id, _kind, state, _archive.Candidate.LogicalName, _archive.Candidate.Path, _engine, Stopwatch.GetElapsedTime(_started), bytes, total, files, percent, precision));
+        private readonly IProgress<ArchiveOperationUpdate>? _progress;
+        private readonly ArchiveContext _archive;
+        private readonly ArchiveOperationKind _kind;
+        private readonly string? _engine;
+        private readonly Guid _id = Guid.NewGuid();
+        private readonly long _started = Stopwatch.GetTimestamp();
+        private readonly object _gate = new();
+        private ArchiveProgressPrecision _bestPrecision = ArchiveProgressPrecision.Indeterminate;
+        private double? _percent;
+        private long _bytes;
+        private long? _total;
+        private int _files;
+        private bool _terminal;
+
+        public OperationScope(IProgress<ArchiveOperationUpdate>? progress, ArchiveContext archive, ArchiveOperationKind kind, string? engine, ArchiveOperationState state)
+        {
+            _progress = progress;
+            _archive = archive;
+            _kind = kind;
+            _engine = engine;
+            Send(state, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate, terminal: false);
+        }
+
+        public void Running() => Send(ArchiveOperationState.Running, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate, terminal: false);
+        public void Waiting() => Send(ArchiveOperationState.WaitingForPassword, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate, terminal: false);
+        public void Report(int fileCount = 0, long bytes = 0, long? total = null, double? percent = null, ArchiveProgressPrecision precision = ArchiveProgressPrecision.Indeterminate) =>
+            Send(ArchiveOperationState.Running, fileCount, bytes, total, percent, precision, terminal: false);
+        public void Complete(int fileCount = 0, long bytes = 0, long? total = null, double? percent = 100, ArchiveProgressPrecision precision = ArchiveProgressPrecision.Exact) =>
+            Send(ArchiveOperationState.Completed, fileCount, bytes, total, percent, precision, terminal: true);
+        public void Fail() => Send(ArchiveOperationState.Failed, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate, terminal: true);
+        public void Cancel() => Send(ArchiveOperationState.Canceled, 0, 0, null, null, ArchiveProgressPrecision.Indeterminate, terminal: true);
+
+        private void Send(ArchiveOperationState state, int files, long bytes, long? total, double? percent, ArchiveProgressPrecision precision, bool terminal)
+        {
+            ArchiveOperationUpdate update;
+            lock (_gate)
+            {
+                if (_terminal) return;
+                if (bytes > _bytes) _bytes = bytes;
+                if (files > _files) _files = files;
+                if (total is > 0) _total = total;
+
+                if (PrecisionRank(precision) >= PrecisionRank(_bestPrecision))
+                {
+                    _bestPrecision = precision;
+                    if (percent is double value)
+                    {
+                        var active = terminal && state == ArchiveOperationState.Completed ? 100 : ClampActivePercent(value);
+                        _percent = Math.Max(_percent ?? 0, active);
+                    }
+                }
+
+                if (terminal) _terminal = true;
+                var outputPercent = terminal && state == ArchiveOperationState.Completed ? 100 : _percent;
+                var outputPrecision = _bestPrecision;
+                update = new ArchiveOperationUpdate(_archive.Id, _archive.ParentId, _id, _kind, state, _archive.Candidate.LogicalName, _archive.Candidate.Path, _engine,
+                    Stopwatch.GetElapsedTime(_started), _bytes, _total, _files, outputPercent, outputPrecision);
+            }
+            _progress?.Report(update);
+        }
+
+        private static int PrecisionRank(ArchiveProgressPrecision precision) => precision switch
+        {
+            ArchiveProgressPrecision.Exact => 3,
+            ArchiveProgressPrecision.Estimated => 2,
+            _ => 1,
+        };
+
         public void Dispose() { if (!_terminal) { } }
     }
 }

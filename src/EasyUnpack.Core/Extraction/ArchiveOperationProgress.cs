@@ -53,4 +53,5 @@ public sealed record ArchivePasswordRequest(
     string ArchiveName,
     string ArchivePath,
     string EngineName,
-    int AttemptedPasswordCount);
+    int AttemptedPasswordCount,
+    bool PreviousAttemptFailed = false);

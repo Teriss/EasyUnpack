@@ -5,10 +5,11 @@ namespace EasyUnpack.App;
 
 public partial class PasswordPromptWindow : Window
 {
-    public PasswordPromptWindow(string archivePath)
+    public PasswordPromptWindow(string archivePath, bool previousAttemptFailed = false)
     {
         InitializeComponent();
         ArchiveNameText.Text = Path.GetFileName(archivePath);
+        RetryMessage.Visibility = previousAttemptFailed ? Visibility.Visible : Visibility.Collapsed;
     }
 
     public string? Password { get; private set; }
